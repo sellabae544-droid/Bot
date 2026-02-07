@@ -158,7 +158,7 @@ async def monitor_loop(bot: Bot, cfg: Config):
                                             chat_id=fresh_token.chat_id,
                                             message_id=fresh_token.leaderboard_message_id,
                                             text=lb_text,
-                                            parse_mode="Markdown",
+                                            parse_mode="HTML",
                                             disable_web_page_preview=True,
                                         )
                                     except Exception:

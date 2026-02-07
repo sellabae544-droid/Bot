@@ -13,7 +13,7 @@ async def main():
     os.makedirs("data", exist_ok=True)
     await init_db()
 
-    bot = Bot(token=cfg.bot_token, parse_mode=ParseMode.MARKDOWN)
+    bot = Bot(token=cfg.bot_token, parse_mode=ParseMode.HTML)
     dp = Dispatcher()
     dp["cfg"] = cfg
     dp.include_router(router)

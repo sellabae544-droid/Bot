@@ -42,7 +42,7 @@ async def is_allowed(message: Message, cfg: Config) -> bool:
 async def start(message: Message, state: FSMContext, cfg: Config):
     await state.clear()
     if not await is_allowed(message, cfg):
-        await message.reply("Add me to a group and configure using a **real admin** (not Anonymous).")
+        await message.reply("Add me to a group and configure using a real admin (not Anonymous).")
         return
     await ensure_chat(message.chat.id)
     active = await get_active_token(message.chat.id)
@@ -57,7 +57,7 @@ async def status_cb(call: CallbackQuery, cfg: Config):
     await call.answer()
     t = await get_active_token(call.message.chat.id)
     if not t:
-        await call.message.reply("No active token. Tap **Add new token**.", reply_markup=menu_keyboard())
+        await call.message.reply("No active token. Tap Add new token.", reply_markup=menu_keyboard())
         return
     await call.message.reply(
         f"🧾 Status\n"
@@ -74,7 +74,7 @@ async def status_cb(call: CallbackQuery, cfg: Config):
 async def add_token_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
     await call.answer()
     await state.set_state(Flow.waiting_token)
-    await call.message.reply("Paste the **TON token address** (Jetton master address).")
+    await call.message.reply("Paste the TON token address (Jetton master address).")
 
 @router.message(Flow.waiting_token)
 async def add_token_msg(message: Message, state: FSMContext, cfg: Config):
@@ -106,7 +106,7 @@ async def list_tokens_cb(call: CallbackQuery, cfg: Config):
     await call.answer()
     toks = await list_tokens(call.message.chat.id)
     if not toks:
-        await call.message.reply("No tokens yet. Tap **Add new token**.", reply_markup=menu_keyboard())
+        await call.message.reply("No tokens yet. Tap Add new token.", reply_markup=menu_keyboard())
         return
     lines = ["🪙 Tokens in this group:"]
     for t in toks[:25]:
@@ -202,7 +202,7 @@ async def set_media_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
         await call.message.reply("Add/select a token first.", reply_markup=menu_keyboard())
         return
     await state.set_state(Flow.waiting_media)
-    await call.message.reply("Send a **photo or gif** now. Send /skip to remove media.")
+    await call.message.reply("Send a photo or gif now. Send /skip to remove media.")
 
 @router.message(Command("skip"), Flow.waiting_media)
 async def media_skip(message: Message, state: FSMContext, cfg: Config):

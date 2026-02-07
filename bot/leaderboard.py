@@ -10,14 +10,14 @@ def _short(addr: str) -> str:
 
 async def render_leaderboard(token_id: int, top_n: int) -> str:
     rows = await top_stats(token_id, top_n)
-    lines = ["🏆 *SpyTON Leaderboard* (Top buyers)"]
+    lines = ["🏆 <b>SpyTON Leaderboard</b> (Top buyers)"]
     if not rows:
         lines.append("\nNo buys yet.")
         return "\n".join(lines)
 
     lines.append("")
     for i, (buyer, ton_total, buy_count) in enumerate(rows, start=1):
-        lines.append(f"{i}. `{_short(buyer)}` — *{ton_total:,.2f} TON* ({buy_count} buys)")
+        lines.append(f"{i}. <code>{_short(buyer)}</code> — <b>{ton_total:,.2f} TON</b> ({buy_count} buys)")
     return "\n".join(lines)
 
 async def ensure_leaderboard_message(msg: Message, token: TokenCfg, text: str):
@@ -28,7 +28,7 @@ async def ensure_leaderboard_message(msg: Message, token: TokenCfg, text: str):
                 chat_id=token.chat_id,
                 message_id=token.leaderboard_message_id,
                 text=text,
-                parse_mode="Markdown",
+                parse_mode="HTML",
                 disable_web_page_preview=True,
             )
             return
@@ -39,7 +39,7 @@ async def ensure_leaderboard_message(msg: Message, token: TokenCfg, text: str):
     sent = await msg.bot.send_message(
         token.chat_id,
         text,
-        parse_mode="Markdown",
+        parse_mode="HTML",
         disable_web_page_preview=True,
     )
     await set_leaderboard_message_id(token.token_id, sent.message_id)

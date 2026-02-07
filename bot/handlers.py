@@ -31,7 +31,7 @@ def _is_url(x: str) -> bool:
 async def is_allowed(message: Message, cfg: Config) -> bool:
     # Allow configuration in group/supergroup by anyone,
     # unless ADMIN_IDS is set (then only those IDs can configure).
-    if message.chat.type not in ("group", "supergroup"):
+    if message.chat.type not in ("group", "supergroup", "channel"):
         return False
 
     # Anonymous admin / sender_chat messages have no from_user.
@@ -50,7 +50,7 @@ async def start(message: Message, state: FSMContext, cfg: Config):
         await message.reply("You are sending as Anonymous Admin. Turn it off, then send /start again.")
         return
     if not await is_allowed(message, cfg):
-        await message.reply("Send /start inside a group. (If ADMIN_IDS is set, only allowed IDs can configure.)")
+        await message.reply("Send /start inside the group/channel where you added me. (If ADMIN_IDS is set, only allowed IDs can configure.)")
         return
     await ensure_chat(message.chat.id)
     active = await get_active_token(message.chat.id)

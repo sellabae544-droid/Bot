@@ -1,5 +1,6 @@
 import asyncio
 import os
+import logging
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 
@@ -7,6 +8,8 @@ from .config import load_config, Config
 from .db import init_db
 from .handlers import router
 from .monitor import monitor_loop
+
+logging.basicConfig(level=logging.INFO)
 
 async def main():
     cfg: Config = load_config()

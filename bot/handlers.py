@@ -29,20 +29,28 @@ def _is_url(x: str) -> bool:
     return bool(re.match(r"^https?://", x.strip(), re.I))
 
 async def is_allowed(message: Message, cfg: Config) -> bool:
+    # Allow configuration in group/supergroup by anyone,
+    # unless ADMIN_IDS is set (then only those IDs can configure).
     if message.chat.type not in ("group", "supergroup"):
         return False
-    member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
-    if member.status not in ("administrator", "creator"):
+
+    # Anonymous admin / sender_chat messages have no from_user.
+    if message.from_user is None:
         return False
+
     if cfg.admin_ids and message.from_user.id not in cfg.admin_ids:
         return False
+
     return True
 
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext, cfg: Config):
     await state.clear()
+    if message.from_user is None:
+        await message.reply("You are sending as Anonymous Admin. Turn it off, then send /start again.")
+        return
     if not await is_allowed(message, cfg):
-        await message.reply("Add me to a group and configure using a real admin (not Anonymous).")
+        await message.reply("Send /start inside a group. (If ADMIN_IDS is set, only allowed IDs can configure.)")
         return
     await ensure_chat(message.chat.id)
     active = await get_active_token(message.chat.id)
@@ -78,6 +86,10 @@ async def add_token_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
 
 @router.message(Flow.waiting_token)
 async def add_token_msg(message: Message, state: FSMContext, cfg: Config):
+    if message.from_user is None:
+        await state.clear()
+        await message.reply("Turn off Anonymous Admin and try again.")
+        return
     if not await is_allowed(message, cfg):
         await state.clear()
         return
@@ -122,6 +134,10 @@ async def select_token_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
 
 @router.message(Flow.waiting_select)
 async def select_token_msg(message: Message, state: FSMContext, cfg: Config):
+    if message.from_user is None:
+        await state.clear()
+        await message.reply("Turn off Anonymous Admin and try again.")
+        return
     if not await is_allowed(message, cfg):
         await state.clear()
         return
@@ -150,6 +166,10 @@ async def set_emoji_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
 
 @router.message(Flow.waiting_emoji)
 async def set_emoji_msg(message: Message, state: FSMContext, cfg: Config):
+    if message.from_user is None:
+        await state.clear()
+        await message.reply("Turn off Anonymous Admin and try again.")
+        return
     if not await is_allowed(message, cfg):
         await state.clear()
         return
@@ -176,6 +196,10 @@ async def set_min_ton_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
 
 @router.message(Flow.waiting_min_ton)
 async def set_min_ton_msg(message: Message, state: FSMContext, cfg: Config):
+    if message.from_user is None:
+        await state.clear()
+        await message.reply("Turn off Anonymous Admin and try again.")
+        return
     if not await is_allowed(message, cfg):
         await state.clear()
         return
@@ -206,6 +230,10 @@ async def set_media_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
 
 @router.message(Command("skip"), Flow.waiting_media)
 async def media_skip(message: Message, state: FSMContext, cfg: Config):
+    if message.from_user is None:
+        await state.clear()
+        await message.reply("Turn off Anonymous Admin and try again.")
+        return
     if not await is_allowed(message, cfg):
         await state.clear()
         return
@@ -219,6 +247,10 @@ async def media_skip(message: Message, state: FSMContext, cfg: Config):
 
 @router.message(Flow.waiting_media)
 async def set_media_msg(message: Message, state: FSMContext, cfg: Config):
+    if message.from_user is None:
+        await state.clear()
+        await message.reply("Turn off Anonymous Admin and try again.")
+        return
     if not await is_allowed(message, cfg):
         await state.clear()
         return
@@ -253,6 +285,10 @@ async def set_token_tg_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
 
 @router.message(Command("skip"), Flow.waiting_token_tg)
 async def token_tg_skip(message: Message, state: FSMContext, cfg: Config):
+    if message.from_user is None:
+        await state.clear()
+        await message.reply("Turn off Anonymous Admin and try again.")
+        return
     if not await is_allowed(message, cfg):
         await state.clear()
         return
@@ -266,6 +302,10 @@ async def token_tg_skip(message: Message, state: FSMContext, cfg: Config):
 
 @router.message(Flow.waiting_token_tg)
 async def token_tg_msg(message: Message, state: FSMContext, cfg: Config):
+    if message.from_user is None:
+        await state.clear()
+        await message.reply("Turn off Anonymous Admin and try again.")
+        return
     if not await is_allowed(message, cfg):
         await state.clear()
         return

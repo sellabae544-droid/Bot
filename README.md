@@ -41,5 +41,5 @@ The bot will create (or reuse) one leaderboard message per token and keep editin
 This version uses HTML parse mode to avoid Telegram Markdown errors.
 
 
-## Public mode
-This build is public: anyone can configure in their own group/channel. Remove ADMIN_IDS if you had it set on Railway.
+### v8 change
+This version matches Crypton flow: /start in group -> Click Here button -> configure in private.

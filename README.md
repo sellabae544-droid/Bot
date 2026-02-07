@@ -39,3 +39,7 @@ The bot will create (or reuse) one leaderboard message per token and keep editin
 
 ### Fix note
 This version uses HTML parse mode to avoid Telegram Markdown errors.
+
+
+## Public mode
+This build is public: anyone can configure in their own group/channel. Remove ADMIN_IDS if you had it set on Railway.

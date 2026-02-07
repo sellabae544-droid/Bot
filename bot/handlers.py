@@ -12,7 +12,7 @@ from .db import (
     set_emoji, set_media, set_min_ton, set_token_telegram, remove_token, get_token
 )
 from .gecko import GeckoClient, parse_token_meta
-from .keyboards import menu_keyboard
+from .keyboards import menu_keyboard, setup_link_keyboard
 from .leaderboard import render_leaderboard, ensure_leaderboard_message
 
 router = Router()
@@ -28,36 +28,65 @@ class Flow(StatesGroup):
 def _is_url(x: str) -> bool:
     return bool(re.match(r"^https?://", x.strip(), re.I))
 
-async def is_allowed(message: Message, cfg: Config) -> bool:
-    # Public bot: anyone can configure in the chat where the bot is added.
-    # We only block Anonymous Admin (no from_user).
-    if message.chat.type not in ("group", "supergroup", "channel"):
-        return False
-    if message.from_user is None:
-        return False
-    return True
+async def _target_chat_id(state: FSMContext, fallback_chat_id: int) -> int:
+    data = await state.get_data()
+    tc = data.get("target_chat_id")
+    if isinstance(tc, int):
+        return tc
+    return fallback_chat_id
+
+def _anon(message: Message) -> bool:
+    # Anonymous admin messages have no from_user; Telegram uses sender_chat instead.
+    return message.from_user is None
 
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext, cfg: Config):
     await state.clear()
-    if message.from_user is None:
-        await message.reply("You are sending as Anonymous Admin. Turn it off, then send /start again.")
+
+    # In GROUP/SUPERGROUP/CHANNEL: send Crypton-style confirmation + setup button
+    if message.chat.type in ("group", "supergroup", "channel"):
+        if _anon(message):
+            await message.reply("Turn off Anonymous Admin, then send /start again.")
+            return
+
+        await ensure_chat(message.chat.id)
+        kb = await setup_link_keyboard(message.bot, message.chat.id)
+        await message.reply(
+            "Your group has been added successfully. You can now use SpyTON BuyBot for your token.\n"
+            "To continue, click "Click Here!"",
+            reply_markup=kb,
+        )
         return
-    if not await is_allowed(message, cfg):
-        await message.reply("Send /start inside the group/channel where you added me.")
+
+    # Private chat: only proceed if deep-link arg exists
+    args = ""
+    if message.text:
+        parts = message.text.split(maxsplit=1)
+        if len(parts) == 2:
+            args = parts[1].strip()
+
+    if args.startswith("cfg_"):
+        try:
+            target_chat = int(args.replace("cfg_", "", 1))
+        except Exception:
+            await message.reply("Invalid setup link. Go back to your group and run /start again.")
+            return
+
+        await state.update_data(target_chat_id=target_chat)
+        await ensure_chat(target_chat)
+
+        active = await get_active_token(target_chat)
+        token_line = f"Active: {active.token_symbol or active.token_name or 'Token'}" if active else "No token yet. Add one."
+        await message.reply(f"🕵️‍♂️ SpyTON BuyBot\n{token_line}\n\nChoose an option:", reply_markup=menu_keyboard())
         return
-    await ensure_chat(message.chat.id)
-    active = await get_active_token(message.chat.id)
-    if active:
-        token_line = f"Active: {active.token_symbol or active.token_name or 'Token'}"
-    else:
-        token_line = "No token yet. Add one."
-    await message.reply(f"🕵️‍♂️ SpyTON BuyBot\n{token_line}\n\nChoose an option:", reply_markup=menu_keyboard())
+
+    await message.reply("Open the group where you added me and type /start there, then click the setup button.")
 
 @router.callback_query(F.data == "status")
-async def status_cb(call: CallbackQuery, cfg: Config):
+async def status_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
     await call.answer()
-    t = await get_active_token(call.message.chat.id)
+    target_chat = await _target_chat_id(state, call.message.chat.id)
+    t = await get_active_token(target_chat)
     if not t:
         await call.message.reply("No active token. Tap Add new token.", reply_markup=menu_keyboard())
         return
@@ -80,19 +109,17 @@ async def add_token_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
 
 @router.message(Flow.waiting_token)
 async def add_token_msg(message: Message, state: FSMContext, cfg: Config):
-    if message.from_user is None:
+    if _anon(message):
         await state.clear()
         await message.reply("Turn off Anonymous Admin and try again.")
         return
-    if not await is_allowed(message, cfg):
-        await state.clear()
-        return
+
+    target_chat = await _target_chat_id(state, message.chat.id)
     token_address = (message.text or "").strip()
     if len(token_address) < 20:
         await message.reply("That address looks too short. Paste the full token address.")
         return
 
-    # Fetch meta (optional). Even if it fails, we still accept token (no CMC dependency).
     symbol = name = None
     try:
         import aiohttp
@@ -103,18 +130,20 @@ async def add_token_msg(message: Message, state: FSMContext, cfg: Config):
     except Exception:
         pass
 
-    token_id = await add_token(message.chat.id, token_address, symbol, name)
+    token_id = await add_token(target_chat, token_address, symbol, name)
     await state.clear()
-    await message.reply(f"✅ Token added and selected. ID: {token_id}\nNow you can set emoji/media/min TON.", reply_markup=menu_keyboard())
+    await state.update_data(target_chat_id=target_chat)
+    await message.reply(f"✅ Token added and selected. ID: {token_id}\nNow set emoji/media/min TON.", reply_markup=menu_keyboard())
 
 @router.callback_query(F.data == "list_tokens")
-async def list_tokens_cb(call: CallbackQuery, cfg: Config):
+async def list_tokens_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
     await call.answer()
-    toks = await list_tokens(call.message.chat.id)
+    target_chat = await _target_chat_id(state, call.message.chat.id)
+    toks = await list_tokens(target_chat)
     if not toks:
         await call.message.reply("No tokens yet. Tap Add new token.", reply_markup=menu_keyboard())
         return
-    lines = ["🪙 Tokens in this group:"]
+    lines = ["🪙 Tokens in this chat:"]
     for t in toks[:25]:
         name = t.token_symbol or t.token_name or "Token"
         lines.append(f"- ID {t.token_id}: {name} ({t.token_address[:8]}…)")
@@ -128,13 +157,11 @@ async def select_token_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
 
 @router.message(Flow.waiting_select)
 async def select_token_msg(message: Message, state: FSMContext, cfg: Config):
-    if message.from_user is None:
+    if _anon(message):
         await state.clear()
         await message.reply("Turn off Anonymous Admin and try again.")
         return
-    if not await is_allowed(message, cfg):
-        await state.clear()
-        return
+    target_chat = await _target_chat_id(state, message.chat.id)
     raw = (message.text or "").strip()
     try:
         token_id = int(raw)
@@ -142,17 +169,19 @@ async def select_token_msg(message: Message, state: FSMContext, cfg: Config):
         await message.reply("Send a number token ID.")
         return
     t = await get_token(token_id)
-    if not t or t.chat_id != message.chat.id:
-        await message.reply("That token ID is not in this group.")
+    if not t or t.chat_id != target_chat:
+        await message.reply("That token ID is not in this chat.")
         return
-    await set_active_token(message.chat.id, token_id)
+    await set_active_token(target_chat, token_id)
     await state.clear()
+    await state.update_data(target_chat_id=target_chat)
     await message.reply(f"✅ Selected token ID {token_id}.", reply_markup=menu_keyboard())
 
 @router.callback_query(F.data == "set_emoji")
 async def set_emoji_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
     await call.answer()
-    if not await get_active_token(call.message.chat.id):
+    target_chat = await _target_chat_id(state, call.message.chat.id)
+    if not await get_active_token(target_chat):
         await call.message.reply("Add/select a token first.", reply_markup=menu_keyboard())
         return
     await state.set_state(Flow.waiting_emoji)
@@ -160,14 +189,12 @@ async def set_emoji_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
 
 @router.message(Flow.waiting_emoji)
 async def set_emoji_msg(message: Message, state: FSMContext, cfg: Config):
-    if message.from_user is None:
+    if _anon(message):
         await state.clear()
         await message.reply("Turn off Anonymous Admin and try again.")
         return
-    if not await is_allowed(message, cfg):
-        await state.clear()
-        return
-    t = await get_active_token(message.chat.id)
+    target_chat = await _target_chat_id(state, message.chat.id)
+    t = await get_active_token(target_chat)
     if not t:
         await state.clear()
         return
@@ -177,12 +204,14 @@ async def set_emoji_msg(message: Message, state: FSMContext, cfg: Config):
         return
     await set_emoji(t.token_id, emoji[:8])
     await state.clear()
+    await state.update_data(target_chat_id=target_chat)
     await message.reply("✅ Emoji updated.", reply_markup=menu_keyboard())
 
 @router.callback_query(F.data == "set_min_ton")
 async def set_min_ton_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
     await call.answer()
-    if not await get_active_token(call.message.chat.id):
+    target_chat = await _target_chat_id(state, call.message.chat.id)
+    if not await get_active_token(target_chat):
         await call.message.reply("Add/select a token first.", reply_markup=menu_keyboard())
         return
     await state.set_state(Flow.waiting_min_ton)
@@ -190,14 +219,12 @@ async def set_min_ton_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
 
 @router.message(Flow.waiting_min_ton)
 async def set_min_ton_msg(message: Message, state: FSMContext, cfg: Config):
-    if message.from_user is None:
+    if _anon(message):
         await state.clear()
         await message.reply("Turn off Anonymous Admin and try again.")
         return
-    if not await is_allowed(message, cfg):
-        await state.clear()
-        return
-    t = await get_active_token(message.chat.id)
+    target_chat = await _target_chat_id(state, message.chat.id)
+    t = await get_active_token(target_chat)
     if not t:
         await state.clear()
         return
@@ -211,12 +238,14 @@ async def set_min_ton_msg(message: Message, state: FSMContext, cfg: Config):
         return
     await set_min_ton(t.token_id, v)
     await state.clear()
+    await state.update_data(target_chat_id=target_chat)
     await message.reply("✅ Min TON updated.", reply_markup=menu_keyboard())
 
 @router.callback_query(F.data == "set_media")
 async def set_media_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
     await call.answer()
-    if not await get_active_token(call.message.chat.id):
+    target_chat = await _target_chat_id(state, call.message.chat.id)
+    if not await get_active_token(target_chat):
         await call.message.reply("Add/select a token first.", reply_markup=menu_keyboard())
         return
     await state.set_state(Flow.waiting_media)
@@ -224,34 +253,32 @@ async def set_media_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
 
 @router.message(Command("skip"), Flow.waiting_media)
 async def media_skip(message: Message, state: FSMContext, cfg: Config):
-    if message.from_user is None:
+    if _anon(message):
         await state.clear()
         await message.reply("Turn off Anonymous Admin and try again.")
         return
-    if not await is_allowed(message, cfg):
-        await state.clear()
-        return
-    t = await get_active_token(message.chat.id)
+    target_chat = await _target_chat_id(state, message.chat.id)
+    t = await get_active_token(target_chat)
     if not t:
         await state.clear()
         return
     await set_media(t.token_id, None)
     await state.clear()
+    await state.update_data(target_chat_id=target_chat)
     await message.reply("✅ Media removed.", reply_markup=menu_keyboard())
 
 @router.message(Flow.waiting_media)
 async def set_media_msg(message: Message, state: FSMContext, cfg: Config):
-    if message.from_user is None:
+    if _anon(message):
         await state.clear()
         await message.reply("Turn off Anonymous Admin and try again.")
         return
-    if not await is_allowed(message, cfg):
-        await state.clear()
-        return
-    t = await get_active_token(message.chat.id)
+    target_chat = await _target_chat_id(state, message.chat.id)
+    t = await get_active_token(target_chat)
     if not t:
         await state.clear()
         return
+
     file_id = None
     if message.animation:
         file_id = message.animation.file_id
@@ -261,17 +288,19 @@ async def set_media_msg(message: Message, state: FSMContext, cfg: Config):
         file_id = message.document.file_id
 
     if not file_id:
-        await message.reply("Please send a **photo** or **gif** (animation). Or /skip.")
+        await message.reply("Please send a photo or gif (animation). Or /skip.")
         return
 
     await set_media(t.token_id, file_id)
     await state.clear()
+    await state.update_data(target_chat_id=target_chat)
     await message.reply("✅ Media saved.", reply_markup=menu_keyboard())
 
 @router.callback_query(F.data == "set_token_tg")
 async def set_token_tg_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
     await call.answer()
-    if not await get_active_token(call.message.chat.id):
+    target_chat = await _target_chat_id(state, call.message.chat.id)
+    if not await get_active_token(target_chat):
         await call.message.reply("Add/select a token first.", reply_markup=menu_keyboard())
         return
     await state.set_state(Flow.waiting_token_tg)
@@ -279,31 +308,28 @@ async def set_token_tg_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
 
 @router.message(Command("skip"), Flow.waiting_token_tg)
 async def token_tg_skip(message: Message, state: FSMContext, cfg: Config):
-    if message.from_user is None:
+    if _anon(message):
         await state.clear()
         await message.reply("Turn off Anonymous Admin and try again.")
         return
-    if not await is_allowed(message, cfg):
-        await state.clear()
-        return
-    t = await get_active_token(message.chat.id)
+    target_chat = await _target_chat_id(state, message.chat.id)
+    t = await get_active_token(target_chat)
     if not t:
         await state.clear()
         return
     await set_token_telegram(t.token_id, None)
     await state.clear()
+    await state.update_data(target_chat_id=target_chat)
     await message.reply("✅ Token Telegram link cleared.", reply_markup=menu_keyboard())
 
 @router.message(Flow.waiting_token_tg)
 async def token_tg_msg(message: Message, state: FSMContext, cfg: Config):
-    if message.from_user is None:
+    if _anon(message):
         await state.clear()
         await message.reply("Turn off Anonymous Admin and try again.")
         return
-    if not await is_allowed(message, cfg):
-        await state.clear()
-        return
-    t = await get_active_token(message.chat.id)
+    target_chat = await _target_chat_id(state, message.chat.id)
+    t = await get_active_token(target_chat)
     if not t:
         await state.clear()
         return
@@ -313,23 +339,25 @@ async def token_tg_msg(message: Message, state: FSMContext, cfg: Config):
         return
     await set_token_telegram(t.token_id, url)
     await state.clear()
+    await state.update_data(target_chat_id=target_chat)
     await message.reply("✅ Token Telegram link saved.", reply_markup=menu_keyboard())
 
 @router.callback_query(F.data == "show_lb")
-async def show_lb_cb(call: CallbackQuery, cfg: Config):
+async def show_lb_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
     await call.answer()
-    t = await get_active_token(call.message.chat.id)
+    target_chat = await _target_chat_id(state, call.message.chat.id)
+    t = await get_active_token(target_chat)
     if not t:
         await call.message.reply("Add/select a token first.", reply_markup=menu_keyboard())
         return
-    # Create or update leaderboard message now
     text = await render_leaderboard(t.token_id, cfg.leaderboard_top_n)
     await ensure_leaderboard_message(call.message, t, text)
 
 @router.callback_query(F.data == "remove_token")
-async def remove_token_cb(call: CallbackQuery, cfg: Config):
+async def remove_token_cb(call: CallbackQuery, state: FSMContext, cfg: Config):
     await call.answer()
-    t = await get_active_token(call.message.chat.id)
+    target_chat = await _target_chat_id(state, call.message.chat.id)
+    t = await get_active_token(target_chat)
     if not t:
         await call.message.reply("No active token.", reply_markup=menu_keyboard())
         return

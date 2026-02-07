@@ -35,3 +35,7 @@ The bot will create (or reuse) one leaderboard message per token and keep editin
 ## Notes
 - You must configure from a real admin (not Anonymous admin).
 - Storage: SQLite at `data/spyton.db`
+
+
+### Fix note
+This version uses HTML parse mode to avoid Telegram Markdown errors.

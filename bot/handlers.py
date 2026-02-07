@@ -29,18 +29,12 @@ def _is_url(x: str) -> bool:
     return bool(re.match(r"^https?://", x.strip(), re.I))
 
 async def is_allowed(message: Message, cfg: Config) -> bool:
-    # Allow configuration in group/supergroup by anyone,
-    # unless ADMIN_IDS is set (then only those IDs can configure).
+    # Public bot: anyone can configure in the chat where the bot is added.
+    # We only block Anonymous Admin (no from_user).
     if message.chat.type not in ("group", "supergroup", "channel"):
         return False
-
-    # Anonymous admin / sender_chat messages have no from_user.
     if message.from_user is None:
         return False
-
-    if cfg.admin_ids and message.from_user.id not in cfg.admin_ids:
-        return False
-
     return True
 
 @router.message(CommandStart())
@@ -50,7 +44,7 @@ async def start(message: Message, state: FSMContext, cfg: Config):
         await message.reply("You are sending as Anonymous Admin. Turn it off, then send /start again.")
         return
     if not await is_allowed(message, cfg):
-        await message.reply("Send /start inside the group/channel where you added me. (If ADMIN_IDS is set, only allowed IDs can configure.)")
+        await message.reply("Send /start inside the group/channel where you added me.")
         return
     await ensure_chat(message.chat.id)
     active = await get_active_token(message.chat.id)

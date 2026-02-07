@@ -21,17 +21,9 @@ def load_config() -> Config:
     if not bot_token:
         raise RuntimeError("BOT_TOKEN is required")
 
-    admin_ids_raw = os.getenv("ADMIN_IDS", "").strip()
-    admin_ids: set[int] = set()
-    if admin_ids_raw:
-        for part in admin_ids_raw.split(","):
-            part = part.strip()
-            if part:
-                admin_ids.add(int(part))
-
     return Config(
         bot_token=bot_token,
-        admin_ids=admin_ids,
+        admin_ids=set(),
         gecko_base_url=os.getenv("GECKO_BASE_URL", "https://api.geckoterminal.com/api/v2").strip(),
         spyton_trending_url=os.getenv("SPYTON_TRENDING_URL", "https://t.me/SpyTonTrending").strip(),
         spyton_listing_url=os.getenv("SPYTON_LISTING_URL", "https://t.me/TonProjectListing").strip(),

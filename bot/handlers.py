@@ -53,7 +53,7 @@ async def start(message: Message, state: FSMContext, cfg: Config):
         kb = await setup_link_keyboard(message.bot, message.chat.id)
         await message.reply(
             "Your group has been added successfully. You can now use SpyTON BuyBot for your token.\n"
-            "To continue, click "Click Here!"",
+            'To continue, click "Click Here!"',
             reply_markup=kb,
         )
         return

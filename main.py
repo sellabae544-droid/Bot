@@ -272,6 +272,11 @@ def save_seen():
 
 
 
+
+# -------------------- CACHES --------------------
+TX_LT_CACHE: Dict[str, Tuple[int, str]] = {}  # key=f"{account}:{lt}" -> (ts, hash)
+MARKET_CACHE: Dict[str, Dict[str, Any]] = {}  # key=pool or token -> {ts, price_usd, liq_usd, mc_usd, holders}
+
 BOT_USERNAME_CACHE = None
 
 async def get_bot_username(bot):
@@ -282,27 +287,70 @@ async def get_bot_username(bot):
     BOT_USERNAME_CACHE = me.username
     return BOT_USERNAME_CACHE
 
+
+async def stonfi_latest_swaps(pool: str, limit: int = 25) -> List[Dict[str, Any]]:
+    """Best-effort: fetch latest pool transactions from TonAPI and treat them as swaps for warmup.
+    This is used only to avoid posting old buys right after configuration."""
+    try:
+        txs = await _to_thread(tonapi_account_transactions, pool, int(limit))
+        out = []
+        for txo in txs or []:
+            h = _tx_hash(txo)
+            if h:
+                out.append({"hash": h})
+        return out
+    except Exception:
+        return []
+
+async def dedust_latest_trades(pool: str, limit: int = 25) -> List[Dict[str, Any]]:
+    """Fetch latest trades from DeDust API in a thread."""
+    try:
+        return await _to_thread(dedust_get_trades, pool, int(limit))
+    except Exception:
+        return []
+
 async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: str|None):
-    """Mark latest swaps as seen so the bot does not spam old buys right after configuration."""
+    """Mark latest swaps as seen so the bot does not spam old buys right after configuration.
+    Also sets baseline last_* ids so we skip anything older than the moment the token was configured."""
     try:
         bucket = SEEN.setdefault(str(chat_id), {})
-        # STON.fi v2
+        newest_ston = None
+        newest_dedust = None
+
+        # STON.fi (warmup by pool tx hashes from TonAPI)
         if ston_pool:
-            swaps = await stonfi_latest_swaps(ston_pool, limit=25)
+            swaps = await stonfi_latest_swaps(ston_pool, limit=40)
             for s in swaps:
                 txhash = (s.get('tx_hash') or s.get('txHash') or s.get('hash') or '').strip()
                 if txhash:
                     bucket[f"ston:{ston_pool}:{txhash}"] = int(time.time())
-        # DeDust
+                    if newest_ston is None:
+                        newest_ston = txhash  # first item is newest
+
+        # DeDust (warmup by latest trade ids and tx hashes where available)
         if dedust_pool:
-            trades = await dedust_latest_trades(dedust_pool, limit=25)
+            trades = await dedust_latest_trades(dedust_pool, limit=40)
             for t in trades:
+                # baseline id (Dedust API usually has 'id' or 'lt')
+                tid = str(t.get("id") or t.get("lt") or t.get("trade_id") or "").strip()
+                if tid and (newest_dedust is None):
+                    newest_dedust = tid
                 txhash = (t.get('tx_hash') or t.get('txHash') or t.get('hash') or '').strip()
                 if txhash:
                     bucket[f"dedust:{dedust_pool}:{txhash}"] = int(time.time())
+
+        # save baselines into group token so polling skips older history
+        g = GROUPS.get(str(chat_id)) or {}
+        tok = g.get("token") if isinstance(g, dict) else None
+        if isinstance(tok, dict):
+            if newest_ston:
+                tok["last_ston_tx"] = newest_ston
+            if newest_dedust:
+                tok["last_dedust_trade"] = newest_dedust
+            save_groups()
+
         save_seen()
     except Exception:
-        # Warmup is best-effort; don't crash config flow
         return
 
 def dedupe_ok(chat_id: int, key: str, ttl: int = 600) -> bool:
@@ -382,35 +430,58 @@ def tonapi_account_events(address: str, limit: int = 10) -> List[Dict[str, Any]]
     ev = js.get("events") if isinstance(js, dict) else None
     return ev if isinstance(ev, list) else []
 
-def tonapi_find_tx_hash_by_lt(account: str, lt: str, limit: int = 25) -> str:
-    """Best-effort: find a real transaction hash for an account by LT.
+def tonapi_find_tx_hash_by_lt(account: str, lt: str, limit: int = 40) -> str:
+    """Find a real transaction hash for an account by LT (with cache + adaptive scan).
 
     Some DEX trade APIs expose only LT; Tonviewer needs the real tx hash.
+    We scan recent account transactions from TonAPI and match by LT.
     """
+    account = str(account or "").strip()
+    if not account:
+        return ""
     try:
         lt_s = str(int(str(lt).strip()))
     except Exception:
         return ""
-    try:
-        txs = tonapi_account_transactions(account, limit=limit)
-        for tx in txs:
-            if not isinstance(tx, dict):
-                continue
-            tid = tx.get("transaction_id") or {}
-            tx_lt = str(tid.get("lt") or tx.get("lt") or "").strip()
-            if not tx_lt:
-                continue
-            try:
-                if str(int(tx_lt)) != lt_s:
-                    continue
-            except Exception:
-                continue
-            h = tid.get("hash") or tx.get("hash") or tx.get("tx_hash") or tx.get("id")
-            return str(h or "").strip()
-    except Exception:
-        return ""
-    return ""
 
+    cache_key = f"{account}:{lt_s}"
+    now = int(time.time())
+    # 24h cache
+    cached = TX_LT_CACHE.get(cache_key)
+    if cached and now - int(cached[0]) < 86400:
+        return str(cached[1] or "").strip()
+
+    # Adaptive scan sizes (fast -> deeper)
+    scan_limits = [max(40, int(limit or 40)), 120, 300, 600]
+    for lim in scan_limits:
+        try:
+            txs = tonapi_account_transactions(account, limit=lim)
+            for tx in txs:
+                if not isinstance(tx, dict):
+                    continue
+                tid = tx.get("transaction_id") or {}
+                tx_lt = str(tid.get("lt") or tx.get("lt") or "").strip()
+                if not tx_lt:
+                    continue
+                try:
+                    if str(int(tx_lt)) != lt_s:
+                        continue
+                except Exception:
+                    continue
+                h = tid.get("hash") or tx.get("hash") or tx.get("tx_hash") or tx.get("id")
+                h = str(h or "").strip()
+                if h:
+                    TX_LT_CACHE[cache_key] = (now, h)
+                    return h
+        except Exception:
+            # brief retry on transient errors
+            try:
+                time.sleep(0.35)
+            except Exception:
+                pass
+            continue
+
+    return ""
 # -------------------- DEX PAIR LOOKUP --------------------
 
 # -------------------- GECKO TERMINAL --------------------
@@ -1442,7 +1513,7 @@ async def poll_once(app: Application):
                         continue
                     if ton_spent < min_buy:
                         continue
-                    dedupe_key = f"ston:{pool}:{tx}:{maker}"
+                    dedupe_key = f"ston:{pool}:{tx}"
                     if not dedupe_ok(chat_id, dedupe_key):
                         continue
                     if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
@@ -1467,13 +1538,13 @@ async def poll_once(app: Application):
                                     continue
                                 txh = str(b.get("tx") or "").strip() or _tx_hash(txo)
                                 buyer = str(b.get("buyer") or "").strip()
-                                dedupe_key = f"stonv2:{pool}:{txh}:{buyer}"
+                                dedupe_key = f"ston:{pool}:{txh}"
                                 if not dedupe_ok(chat_id, dedupe_key):
                                     continue
                                 if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
                                     continue
                                 burst["count"] += 1
-                                await post_buy(app, chat_id, token, {"tx": txh, "buyer": buyer, "ton": ton_spent, "token_amount": float(b.get("token_amount") or 0.0)}, source="STON.fi")
+                                await post_buy(app, chat_id, token, {"tx": txh, "buyer": buyer, "ton": ton_spent, "token_amount": float(b.get("token_amount") or 0.0)}, source="STON.fi v2")
                         save_groups()
                     except Exception as _e:
                         log.debug("STON v2 fallback err chat=%s %s", chat_id, _e)
@@ -1499,7 +1570,7 @@ async def poll_once(app: Application):
                     ton_amt = float(b.get("ton") or 0.0)
                     if ton_amt < min_buy:
                         continue
-                    dedupe_key = f"dedust:{pool}:{b.get('tx')}:{b.get('buyer')}"
+                    dedupe_key = f"dedust:{pool}:{b.get('tx')}"
                     if not dedupe_ok(chat_id, dedupe_key):
                         continue
                     if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
@@ -1541,6 +1612,14 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
 
     # Market data (prefer GeckoTerminal)
     price_usd = liq_usd = mc_usd = None
+    # Try cache first to avoid missing stats (rate limits / temporary failures)
+    market_cache_key = str(pool_for_market or token_addr or "").strip()
+    _mcached = MARKET_CACHE.get(market_cache_key) if market_cache_key else None
+    _now = int(time.time())
+    if _mcached and _now - int(_mcached.get("ts") or 0) < 900:
+        price_usd = _mcached.get("price_usd")
+        liq_usd = _mcached.get("liq_usd")
+        mc_usd = _mcached.get("mc_usd")
     if pool_for_market:
         pinfo = gecko_pool_info(pool_for_market)
         if pinfo:
@@ -1581,6 +1660,16 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     except Exception:
         holders = None
 
+    # Store/refresh cache so later messages don't lose stats
+    if market_cache_key:
+        MARKET_CACHE[market_cache_key] = {
+            "ts": int(time.time()),
+            "price_usd": price_usd,
+            "liq_usd": liq_usd,
+            "mc_usd": mc_usd,
+            "holders": holders,
+        }
+
     # Links row
     pair_for_links = pool_for_market or ""
     tx_hex = _normalize_tx_hash_to_hex(tx)
@@ -1588,7 +1677,17 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     if not tx_hex and source == "DeDust":
         lt_guess = str(b.get("trade_id") or tx or "").strip()
         if lt_guess:
-            resolved = tonapi_find_tx_hash_by_lt(str(dedust_pool or ""), lt_guess, limit=40)
+            resolved = tonapi_find_tx_hash_by_lt(str(dedust_pool or ""), lt_guess, limit=300)
+            if not resolved:
+                # quick retries for busy pools
+                for _ in range(3):
+                    try:
+                        time.sleep(0.35)
+                    except Exception:
+                        pass
+                    resolved = tonapi_find_tx_hash_by_lt(str(dedust_pool or ""), lt_guess, limit=600)
+                    if resolved:
+                        break
             tx_hex = _normalize_tx_hash_to_hex(resolved) or tx_hex
     tx_url = f"https://tonviewer.com/transaction/{tx_hex}" if tx_hex else None
     gt_url = gecko_terminal_pool_url(pair_for_links) if pair_for_links else None
@@ -1634,7 +1733,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
 
     lines: List[str] = []
     # Header similar to Crypton
-    lines.append(f"*{html.escape(title)} Buy!* — {html.escape(source)}")
+    lines.append(f"*{html.escape(title)} Buy!*")
     if strength_block:
         lines.append(strength_block)
     lines.append("")
@@ -1646,23 +1745,21 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         except Exception:
             lines.append(f"Got: *{html.escape(str(tok_amt))} {html.escape(str(tok_symbol))}*")
     lines.append("")
-    # Buyer wallet clickable + Txn link next to it (Crypton-style)
-    if buyer_url and tx_url:
-        lines.append(f"[{buyer_short}]({buyer_url}) | [Txn]({tx_url})")
-    elif buyer_url:
-        lines.append(f"[{buyer_short}]({buyer_url})")
+    # Buyer wallet clickable + Txn label next to it (Crypton-style)
+    if buyer_url:
+        if tx_url:
+            lines.append(f"[{buyer_short}]({buyer_url}) | [Txn]({tx_url})")
+        else:
+            # Keep the Txn label visible even if we couldn't resolve a tx hash yet
+            lines.append(f"[{buyer_short}]({buyer_url}) | Txn")
     else:
         lines.append(f"{buyer_short}")
 
-    # Stats (Crypton-style)
-    if price_usd is not None:
-        lines.append(f"Price: {fmt_usd(price_usd, 6)}")
-    if liq_usd is not None:
-        lines.append(f"Liquidity: {fmt_usd(liq_usd, 0)}")
-    if mc_usd is not None:
-        lines.append(f"MCap: {fmt_usd(mc_usd, 0)}")
-    if holders is not None:
-        lines.append(f"Holders: {holders}")
+    # Stats (Crypton-style) - keep stable layout (no disappearing lines)
+    lines.append(f"Price: {fmt_usd(price_usd, 6) if price_usd is not None else '—'}")
+    lines.append(f"Liquidity: {fmt_usd(liq_usd, 0) if liq_usd is not None else '—'}")
+    lines.append(f"MCap: {fmt_usd(mc_usd, 0) if mc_usd is not None else '—'}")
+    lines.append(f"Holders: {holders if holders is not None else '—'}")
 
     lines.append("")
     # Keep only TX | GT | DexS | Telegram | Trending

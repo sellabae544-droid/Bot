@@ -1039,6 +1039,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Resolve either a jetton address or a supported link (GT / DexScreener / STON / DeDust)
+    # optional token Telegram link in same message
+    tg_in = None
+    m = re.search(r'(https?://t\.me/[^\s]+|t\.me/[^\s]+)', text)
+    if m:
+        tg_in = m.group(1)
+        if tg_in.startswith('t.me/'):
+            tg_in = 'https://' + tg_in
     addr = await _to_thread(resolve_jetton_from_text_sync, text)
     if not addr:
         return
@@ -1057,9 +1064,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # If user pressed configure, it's this chat anyway
         target_chat_id = chat.id
 
-    await configure_group_token(target_chat_id, addr, context, reply_to_chat=chat.id)
+    await configure_group_token(target_chat_id, addr, context, reply_to_chat=chat.id, token_tg=tg_in)
 
-async def configure_group_token(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_to_chat: int):
+async def configure_group_token(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_to_chat: int, token_tg: Optional[str] = None):
     g = get_group(chat_id)
     # 1 token per group: confirm replace if exists and different
     existing = g.get("token") or None
@@ -1135,6 +1142,7 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "address": jetton,
         "name": name,
         "symbol": sym,
+        "telegram": token_tg or "",
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
         "set_at": int(time.time()),
@@ -1383,7 +1391,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     tx_url = f"https://tonviewer.com/transaction/{tx}" if tx else None
     gt_url = gecko_terminal_pool_url(pair_for_links) if pair_for_links else None
     dex_url = f"https://dexscreener.com/ton/{pair_for_links}" if pair_for_links else None
-    tg_link = token.get("telegram") or DEFAULT_TOKEN_TG
+    tg_link = token.get("telegram") or ""
     trending = TRENDING_URL
 
 
@@ -1433,7 +1441,6 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
             tok_line = f"🪙 <b>{html.escape(str(tok_amt))} {html.escape(str(tok_symbol))}</b>"
 
     # Build links row (keep only TX | GT | DexS | Telegram | Trending)
- (keep only TX | GT | DexS | Telegram | Trending)
     link_parts: List[str] = []
     if tx_url:
         link_parts.append(f'<a href="{html.escape(tx_url)}">TX</a>')

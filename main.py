@@ -382,6 +382,35 @@ def tonapi_account_events(address: str, limit: int = 10) -> List[Dict[str, Any]]
     ev = js.get("events") if isinstance(js, dict) else None
     return ev if isinstance(ev, list) else []
 
+def tonapi_find_tx_hash_by_lt(account: str, lt: str, limit: int = 25) -> str:
+    """Best-effort: find a real transaction hash for an account by LT.
+
+    Some DEX trade APIs expose only LT; Tonviewer needs the real tx hash.
+    """
+    try:
+        lt_s = str(int(str(lt).strip()))
+    except Exception:
+        return ""
+    try:
+        txs = tonapi_account_transactions(account, limit=limit)
+        for tx in txs:
+            if not isinstance(tx, dict):
+                continue
+            tid = tx.get("transaction_id") or {}
+            tx_lt = str(tid.get("lt") or tx.get("lt") or "").strip()
+            if not tx_lt:
+                continue
+            try:
+                if str(int(tx_lt)) != lt_s:
+                    continue
+            except Exception:
+                continue
+            h = tid.get("hash") or tx.get("hash") or tx.get("tx_hash") or tx.get("id")
+            return str(h or "").strip()
+    except Exception:
+        return ""
+    return ""
+
 # -------------------- DEX PAIR LOOKUP --------------------
 
 # -------------------- GECKO TERMINAL --------------------
@@ -1151,6 +1180,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not addr:
         return
 
+    # Optional: token telegram link can be sent together with CA.
+    # Example: EQ... https://t.me/YourToken
+    tg_url = ""
+    m_tg = re.search(r"https?://t\.me/[A-Za-z0-9_]{3,}(?:\S*)?", text)
+    if m_tg:
+        tg_url = m_tg.group(0).strip()
+
     # decide which chat to configure
     target_chat_id = None
     if chat.type == "private":
@@ -1165,7 +1201,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # If user pressed configure, it's this chat anyway
         target_chat_id = chat.id
 
-    await configure_group_token(target_chat_id, addr, context, reply_to_chat=chat.id)
+    await configure_group_token(target_chat_id, addr, context, reply_to_chat=chat.id, telegram=tg_url)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1203,10 +1239,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("✅ Buy image saved. Image mode is now ON.")
 
-async def configure_group_token(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_to_chat: int):
+async def configure_group_token(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_to_chat: int, telegram: str = ""):
     g = get_group(chat_id)
     # 1 token per group: confirm replace if exists and different
     existing = g.get("token") or None
+    # Same token: allow updating telegram link without replacing anything.
+    if existing and existing.get("address") == jetton and telegram:
+        existing["telegram"] = telegram
+        save_groups()
+        await context.bot.send_message(chat_id=reply_to_chat, text="✅ Token Telegram link updated.")
+        return
     if existing and existing.get("address") != jetton:
         # Ask confirmation
         kb = InlineKeyboardMarkup([
@@ -1220,7 +1262,7 @@ async def configure_group_token(chat_id: int, jetton: str, context: ContextTypes
             parse_mode="Markdown"
         )
         return
-    await _set_token_now(chat_id, jetton, context, reply_to_chat)
+    await _set_token_now(chat_id, jetton, context, reply_to_chat, telegram=telegram)
 
 async def on_replace_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1258,7 +1300,7 @@ async def on_replace_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Cancelled.")
         return
 
-async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_chat_id: int):
+async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_chat_id: int, telegram: str = ""):
     # Token metadata (GeckoTerminal first, then TonAPI, then DexScreener)
     gk = gecko_token_info(jetton)
     name = (gk.get("name") or "").strip() if gk else ""
@@ -1285,6 +1327,7 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "last_ston_tx": None,
         "last_dedust_trade": None,
         "burst": {"window_start": int(time.time()), "count": 0},
+        "telegram": telegram.strip() if telegram else "",
     }
     save_groups()
 
@@ -1464,6 +1507,7 @@ async def poll_once(app: Application):
                     burst["count"] += 1
                     await post_buy(app, chat_id, token, {
                         "tx": b.get("tx"),
+                        "trade_id": trade_id,
                         "buyer": b.get("buyer"),
                         "ton": ton_amt,
                         "token_amount": float(b.get("token_amount") or 0.0),
@@ -1540,10 +1584,18 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     # Links row
     pair_for_links = pool_for_market or ""
     tx_hex = _normalize_tx_hash_to_hex(tx)
+    # DeDust sometimes returns only LT (no hash). Resolve hash via TonAPI if possible.
+    if not tx_hex and source == "DeDust":
+        lt_guess = str(b.get("trade_id") or tx or "").strip()
+        if lt_guess:
+            resolved = tonapi_find_tx_hash_by_lt(str(dedust_pool or ""), lt_guess, limit=40)
+            tx_hex = _normalize_tx_hash_to_hex(resolved) or tx_hex
     tx_url = f"https://tonviewer.com/transaction/{tx_hex}" if tx_hex else None
     gt_url = gecko_terminal_pool_url(pair_for_links) if pair_for_links else None
     dex_url = f"https://dexscreener.com/ton/{pair_for_links}" if pair_for_links else None
-    tg_link = token.get("telegram") or DEFAULT_TOKEN_TG
+    # Token telegram button should reflect the token's own link.
+    # If not set, hide the button (avoid wrong/static links).
+    tg_link = (token.get("telegram") or "").strip()
     trending = TRENDING_URL
 
     # Pull settings for this chat (for strength + image)
@@ -1594,8 +1646,10 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         except Exception:
             lines.append(f"Got: *{html.escape(str(tok_amt))} {html.escape(str(tok_symbol))}*")
     lines.append("")
-    # Buyer wallet clickable
-    if buyer_url:
+    # Buyer wallet clickable + Txn link next to it (Crypton-style)
+    if buyer_url and tx_url:
+        lines.append(f"[{buyer_short}]({buyer_url}) | [Txn]({tx_url})")
+    elif buyer_url:
         lines.append(f"[{buyer_short}]({buyer_url})")
     else:
         lines.append(f"{buyer_short}")

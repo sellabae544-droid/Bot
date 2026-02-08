@@ -684,52 +684,12 @@ async def build_add_to_group_url(app: Application) -> str:
         pass
     return "https://t.me/"  # fallback
 
-
-async def build_private_config_url(application: Application, chat_id: int) -> str:
-    """Deep-link into private chat so configuration happens in DM (Crypton-style)."""
-    try:
-        me = await application.bot.get_me()
-        if me and me.username:
-            gid_enc = f"n{abs(int(chat_id))}" if int(chat_id) < 0 else f"p{int(chat_id)}"
-            return f"https://t.me/{me.username}?start=cfg_{gid_enc}"
-    except Exception:
-        pass
-    return "https://t.me/"
-
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
-    user = update.effective_user
     if not chat:
         return
 
     if chat.type == "private":
-
-        # If opened via deep-link from a group, start configuration in DM (Crypton-style)
-        if context.args and len(context.args) >= 1:
-            arg0 = str(context.args[0])
-            if arg0.startswith("cfg_"):
-                try:
-                    gid_raw = arg0.split("_", 1)[1]
-                    if gid_raw.startswith("n"):
-                        target_gid = -int(gid_raw[1:])
-                    elif gid_raw.startswith("p"):
-                        target_gid = int(gid_raw[1:])
-                    else:
-                        target_gid = int(gid_raw)
-                    AWAITING[user.id] = target_gid
-                    context.user_data["pending_cfg_group"] = target_gid
-                    await update.message.reply_text(
-                        """✅ *SpyTON BuyBot connected*
-
-Please enter your token CA (EQ… / UQ…) or send a supported link (GT/DexS/STON/DeDust).
-
-Tip: You can also paste the Telegram link after the CA.
-Example: `EQ... https://t.me/YourTokenTG`""",
-                        parse_mode="Markdown"
-                    )
-                    return
-                except Exception:
-                    pass
         add_url = await build_add_to_group_url(context.application)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add BuyBot to Group", url=add_url)],
@@ -745,9 +705,8 @@ Example: `EQ... https://t.me/YourTokenTG`""",
         )
     else:
         # In group, show group menu
-        cfg_url = await build_private_config_url(context.application, chat.id)
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("⚙️ Configure Token", url=cfg_url)],
+            [InlineKeyboardButton("⚙️ Configure Token", callback_data="CFG_GROUP")],
             [InlineKeyboardButton("🛠 Settings", callback_data="SET_GROUP")],
             [InlineKeyboardButton("📊 Status", callback_data="STATUS_GROUP")],
             [InlineKeyboardButton("🗑 Remove Token", callback_data="REMOVE_GROUP")],
@@ -1001,6 +960,8 @@ def resolve_jetton_from_text_sync(text: str) -> Optional[str]:
         return None
 
     # 1) Direct jetton address
+    # Users often paste addresses wrapped inside other text (ref links, underscores, etc.).
+    # Try the whole string first, then try extracting address-like substrings.
     direct = detect_token_address(t)
     if direct:
         # If it *looks* like a pool link context, try pair lookup first
@@ -1018,6 +979,21 @@ def resolve_jetton_from_text_sync(text: str) -> Optional[str]:
                 if quote_sym == "TON" and base_addr:
                     return base_addr
         return direct
+
+    # Try to extract any EQ/UQ-like substrings (base64url) and re-run detection.
+    # This fixes cases like: EQB420y..._j1f_tPu1J488I__PX
+    candidates = []
+    for m in re.findall(r"[EU]Q[A-Za-z0-9_-]{40,70}", t):
+        candidates.append(m)
+    # Also include regex matches used elsewhere
+    m2 = JETTON_RE.findall(t)
+    if m2:
+        candidates.extend(m2)
+    for cand in candidates:
+        cand = cand.strip()
+        d = detect_token_address(cand)
+        if d:
+            return d
 
     # 2) GeckoTerminal / Dexscreener / ston.fi / dedust.io pool links
     pair_id = None
@@ -1057,7 +1033,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat or not update.effective_user:
         return
     chat = update.effective_chat
-    user = update.effective_user
     user = update.effective_user
     text = (update.message.text or "").strip()
 
@@ -1099,6 +1074,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tg_in = 'https://' + tg_in
     addr = await _to_thread(resolve_jetton_from_text_sync, text)
     if not addr:
+        # Only reply with an error if the user is *currently* configuring.
+        if chat.type == "private" and AWAITING.get(user.id):
+            await update.message.reply_text(
+                "❌ I couldn't detect a TON token address from that message.\n\n"
+                "Send a *Jetton master address* (starts with EQ… / UQ…) or a supported link:\n"
+                "• GeckoTerminal pool link\n• STON.fi pool link\n• DeDust pool link\n• DexScreener link",
+                parse_mode="Markdown"
+            )
+        elif chat.type != "private":
+            pending_mid = PENDING_REPLY.get(chat.id)
+            if pending_mid and update.message.reply_to_message and update.message.reply_to_message.message_id == pending_mid:
+                await update.message.reply_text(
+                    "❌ I couldn't detect the token from that.\n\n"
+                    "Tip: paste the *Jetton master address* (EQ…/UQ…) or a GeckoTerminal/STON.fi/DeDust link.",
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True
+                )
         return
 
     # decide which chat to configure

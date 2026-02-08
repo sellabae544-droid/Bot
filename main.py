@@ -33,6 +33,10 @@ GECKO_BASE = os.getenv("GECKO_BASE", "https://api.geckoterminal.com/api/v2").str
 DATA_FILE = os.getenv("GROUPS_FILE", "groups_public.json")
 SEEN_FILE = os.getenv("SEEN_FILE", "seen_public.json")
 
+# When a group sends a token address without specifying DEX, we ask which DEX to track.
+# Key: "<chat_id>:<user_id>" -> {"addr": str, "tg": Optional[str]}
+PENDING_GROUP_DEX: Dict[str, Dict[str, Any]] = {}
+
 # Dexscreener endpoints (used to resolve pool<->token)
 DEX_TOKEN_URL = os.getenv("DEX_TOKEN_URL", "https://api.dexscreener.com/latest/dex/tokens").rstrip("/")
 DEX_PAIR_URL = os.getenv("DEX_PAIR_URL", "https://api.dexscreener.com/latest/dex/pairs").rstrip("/")
@@ -1005,6 +1009,32 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+
+    # DEX selection in group (when user pasted just CA)
+    if data.startswith("GDEX:"):
+        mode = data.split(":", 1)[1]
+        key = f"{chat.id}:{user.id}"
+        pending = PENDING_GROUP_DEX.get(key)
+        if not pending:
+            await q.answer("No pending token.", show_alert=True)
+            return
+        if mode == "cancel":
+            PENDING_GROUP_DEX.pop(key, None)
+            try:
+                await q.edit_message_text("Cancelled.")
+            except Exception:
+                pass
+            return
+        addr = pending.get("addr")
+        tg_url = pending.get("tg")
+        PENDING_GROUP_DEX.pop(key, None)
+        await configure_group_token(update, context, addr=addr, tg_url=tg_url, dex_mode=mode)
+        try:
+            await q.edit_message_text("✅ Token configured.")
+        except Exception:
+            pass
+        return
+
     # DEX selection in private DM config
     if data.startswith("DEX_STON_") or data.startswith("DEX_DEDUST_"):
         try:
@@ -1684,10 +1714,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # in group: only admins can configure
         if not await is_admin(context.bot, chat.id, user.id):
             return
-        # If user pressed configure, it's this chat anyway
         target_chat_id = chat.id
-        dex_mode = "both"
 
+        # If user didn't specify a DEX/link, ask which DEX to track (prevents DeDust backfill spam).
+        lower = (text or "").lower()
+        inferred = None
+        if STON_POOL_RE.search(text) or 'ston.fi' in lower or 'stonfi' in lower:
+            inferred = 'ston'
+        elif DEDUST_POOL_RE.search(text) or 'dedust' in lower:
+            inferred = 'dedust'
+
+        if not inferred:
+            key = f"{chat.id}:{user.id}"
+            PENDING_GROUP_DEX[key] = {'addr': addr, 'tg': tg_url, 'group_id': chat.id}
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton('STON.fi', callback_data='GDEX:ston'),
+                InlineKeyboardButton('DeDust', callback_data='GDEX:dedust'),
+            ], [
+                InlineKeyboardButton('Both', callback_data='GDEX:both'),
+                InlineKeyboardButton('Cancel', callback_data='GDEX:cancel'),
+            ]])
+            await update.message.reply_text('Choose the DEX for this token:', reply_markup=kb)
+            return
+
+        dex_mode = inferred
     await configure_group_token(target_chat_id, addr, context, reply_to_chat=chat.id, telegram=tg_url, dex_mode=dex_mode)
     # Clear awaiting state after successful input
     if chat.type == "private":

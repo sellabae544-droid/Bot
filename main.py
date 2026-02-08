@@ -1460,6 +1460,19 @@ async def poll_once(app: Application):
     for chat_id, g in items:
         token = g["token"]
         settings = g.get("settings") or DEFAULT_SETTINGS
+
+        # One-time initialization per chat to prevent "old buys" spam.
+        # If the bot restarts or a token was configured long ago, we warm up cursors/seen once
+        # and skip posting on that first cycle.
+        if not token.get("init_done"):
+            try:
+                await warmup_seen_for_chat(chat_id, token.get("ston_pool"), token.get("dedust_pool"))
+            except Exception:
+                pass
+            token["init_done"] = True
+            save_groups()
+            continue
+
         min_buy = float(settings.get("min_buy_ton") or 0.0)
         anti = (settings.get("anti_spam") or "MED").upper()
         max_msgs, window = anti_spam_limit(anti)

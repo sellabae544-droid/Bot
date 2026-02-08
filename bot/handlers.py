@@ -9,7 +9,8 @@ from aiogram.fsm.state import State, StatesGroup
 from .config import Config
 from .db import (
     ensure_chat, add_token, get_active_token, list_tokens, set_active_token,
-    set_emoji, set_media, set_min_ton, set_token_telegram, remove_token, get_token
+    set_emoji, set_media, set_min_ton, set_token_telegram, remove_token, get_token,
+    set_user_target, get_user_target
 )
 from .gecko import GeckoClient, parse_token_meta
 from .keyboards import menu_keyboard, setup_link_keyboard
@@ -50,6 +51,7 @@ async def start(message: Message, state: FSMContext, cfg: Config):
             return
 
         await ensure_chat(message.chat.id)
+        await set_user_target(message.from_user.id, message.chat.id)
         kb = await setup_link_keyboard(message.bot, message.chat.id)
         await message.reply(
             "Your group has been added successfully. You can now use SpyTON BuyBot for your token.\n"
@@ -80,7 +82,18 @@ async def start(message: Message, state: FSMContext, cfg: Config):
         await message.reply(f"🕵️‍♂️ SpyTON BuyBot\n{token_line}\n\nChoose an option:", reply_markup=menu_keyboard())
         return
 
-    await message.reply("Open the group where you added me and type /start there, then click the setup button.")
+    # If Telegram didn't pass the deep-link parameter, try last used group for this user.
+    if message.from_user is not None:
+        last_chat = await get_user_target(message.from_user.id)
+        if last_chat:
+            await state.update_data(target_chat_id=last_chat)
+            await ensure_chat(last_chat)
+            active = await get_active_token(last_chat)
+            token_line = f"Active: {active.token_symbol or active.token_name or 'Token'}" if active else "No token yet. Add one."
+            await message.reply(f"🕵️‍♂️ SpyTON BuyBot\n{token_line}\n\nChoose an option:", reply_markup=menu_keyboard())
+            return
+
+    await message.reply("Go to your group/channel, type /start, then tap Click Here!. If Telegram opens me without a parameter, press /start again here.")
 
 @router.callback_query(F.data == "status")
 async def status_cb(call: CallbackQuery, state: FSMContext, cfg: Config):

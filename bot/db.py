@@ -30,7 +30,12 @@ async def init_db():
             );"""
         )
         await db.execute(
-            """CREATE TABLE IF NOT EXISTS tokens (
+            """CREATE TABLE IF NOT EXISTS user_sessions (
+    user_id INTEGER PRIMARY KEY,
+    target_chat_id INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tokens (
                 token_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
                 token_address TEXT NOT NULL,
@@ -231,3 +236,19 @@ async def top_stats(token_id: int, top_n: int) -> List[Tuple[str, float, int]]:
             (token_id, top_n),
         )
         return [(r[0], float(r[1]), int(r[2])) for r in rows]
+
+
+async def set_user_target(user_id: int, target_chat_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO user_sessions (user_id, target_chat_id) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET target_chat_id=excluded.target_chat_id",
+            (user_id, target_chat_id),
+        )
+        await db.commit()
+
+async def get_user_target(user_id: int) -> int | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT target_chat_id FROM user_sessions WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        return int(row[0]) if row else None

@@ -38,6 +38,5 @@ async def setup_link_keyboard(bot, chat_id: int):
     url = f"https://t.me/{me.username}?start=cfg_{chat_id}"
     kb = InlineKeyboardBuilder()
     kb.button(text="Click Here!", url=url)
-    kb.button(text="BuyBot Guide", url="https://docs.crypton.tools/crypton-buy-bot/getting-started")
-    kb.adjust(1, 1)
+    kb.adjust(1)
     return kb.as_markup()

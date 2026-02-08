@@ -4,6 +4,32 @@ from typing import Any, Dict, Optional, List, Tuple
 from urllib.parse import urlparse
 import requests
 
+
+# --- TON price (USD) cache ---
+_TON_PRICE_CACHE = {"ts": 0.0, "price": None}
+
+def get_ton_price_usd() -> Optional[float]:
+    """Fetch TON price in USD. Cached for 60s to avoid rate limits.
+    Uses CoinGecko simple price endpoint.
+    """
+    try:
+        now = time.time()
+        if _TON_PRICE_CACHE["price"] is not None and (now - _TON_PRICE_CACHE["ts"]) < 60:
+            return float(_TON_PRICE_CACHE["price"])
+        # CoinGecko id for TON is commonly 'the-open-network'
+        url = "https://api.coingecko.com/api/v3/simple/price"
+        r = requests.get(url, params={"ids": "the-open-network", "vs_currencies": "usd"}, timeout=10)
+        if r.status_code == 200:
+            j = r.json()
+            p = (j.get("the-open-network") or {}).get("usd")
+            if p:
+                _TON_PRICE_CACHE["ts"] = now
+                _TON_PRICE_CACHE["price"] = float(p)
+                return float(p)
+    except Exception:
+        pass
+    return None
+
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -221,6 +247,8 @@ SEEN: Dict[str, Any] = _load_json(SEEN_FILE, {})    # chat_id -> {dedupe_key: ts
 
 # user_id -> chat_id awaiting token paste
 AWAITING: Dict[int, int] = {}
+# user_id -> chat_id awaiting media upload (photo/gif)
+AWAITING_MEDIA: Dict[int, int] = {}
 
 # -------------------- HELPERS --------------------
 JETTON_RE = re.compile(r"\b([EU]Q[A-Za-z0-9_-]{40,80})\b")
@@ -762,6 +790,39 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_settings(chat.id, context, q.message, edit=True)
         return
 
+
+    if data.startswith("STR_"):
+        if not await is_admin(context.bot, chat.id, user.id):
+            await q.answer("Admins only.", show_alert=True)
+            return
+        g = get_group(chat.id)
+        s = g["settings"]
+        s["strength"] = data.split("_",1)[1]
+        save_groups()
+        await send_settings(chat.id, context, q.message, edit=True)
+        return
+
+    if data == "MEDIA_SET":
+        if not await is_admin(context.bot, chat.id, user.id):
+            await q.answer("Admins only.", show_alert=True)
+            return
+        AWAITING_MEDIA[user.id] = chat.id
+        await q.message.reply_text("Send the *photo* or *GIF* you want to show on every buy in this group.", parse_mode="Markdown")
+        return
+
+    if data == "MEDIA_CLEAR":
+        if not await is_admin(context.bot, chat.id, user.id):
+            await q.answer("Admins only.", show_alert=True)
+            return
+        g = get_group(chat.id)
+        s = g["settings"]
+        s.pop("media_file_id", None)
+        s.pop("media_type", None)
+        save_groups()
+        await q.message.reply_text("✅ Buy image cleared for this group.")
+        await send_settings(chat.id, context, q.message, edit=True)
+        return
+
     if data == "STATUS_GROUP":
         await send_status(chat.id, context, q.message)
         return
@@ -811,6 +872,8 @@ async def send_settings(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg, e
         f"• Burst mode: *{burst}*\n"
         f"• Anti-spam: *{anti}*\n"
         f"• Min buy (TON): *{min_buy}*\n"
+        f"• Buy strength: *{(s.get(\'strength\') or \'MED\').upper()}*\n"
+        f"• Media: *{\'SET ✅\' if s.get(\'media_file_id\') else \'NONE\'}*\n"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"STON.fi: {ston}", callback_data="TOG_STON"),
@@ -824,6 +887,8 @@ async def send_settings(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg, e
         [InlineKeyboardButton("Anti: LOW", callback_data="SPAM_LOW"),
          InlineKeyboardButton("MED", callback_data="SPAM_MED"),
          InlineKeyboardButton("HIGH", callback_data="SPAM_HIGH")],
+        [InlineKeyboardButton("Strength: LOW", callback_data="STR_LOW"), InlineKeyboardButton("MED", callback_data="STR_MED"), InlineKeyboardButton("HIGH", callback_data="STR_HIGH")],
+        [InlineKeyboardButton("🖼 Set Buy Image", callback_data="MEDIA_SET"), InlineKeyboardButton("🧹 Clear Image", callback_data="MEDIA_CLEAR")],
     ])
     if edit:
         try:
@@ -944,6 +1009,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
     text = (update.message.text or "").strip()
+
+    # If admin is setting media for this group
+    awaiting_chat = AWAITING_MEDIA.get(user.id)
+    if awaiting_chat and chat.id == awaiting_chat:
+        # Accept photo or GIF (animation)
+        media_file_id = None
+        media_type = None
+        if update.message.photo:
+            media_file_id = update.message.photo[-1].file_id
+            media_type = "photo"
+        elif update.message.animation:
+            media_file_id = update.message.animation.file_id
+            media_type = "animation"
+        elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
+            media_file_id = update.message.document.file_id
+            media_type = "photo"
+        if media_file_id:
+            g = get_group(chat.id)
+            s = g["settings"]
+            s["media_file_id"] = media_file_id
+            s["media_type"] = media_type
+            save_groups()
+            AWAITING_MEDIA.pop(user.id, None)
+            await update.message.reply_text("✅ Buy image saved for this group.")
+            await send_settings(chat.id, context, update.message)
+            return
+        # If they sent something else, ignore and keep waiting
+        return
 
     # Resolve either a jetton address or a supported link (GT / DexScreener / STON / DeDust)
     addr = await _to_thread(resolve_jetton_from_text_sync, text)
@@ -1232,8 +1325,8 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     title = sym or name or "TOKEN"
 
     ton_amt = float(b.get("ton") or 0.0)
-    tok_amt = b.get("token_amt")
-    tok_symbol = b.get("token_symbol") or sym or ""
+    tok_amt = b.get("token_amt") if b.get("token_amt") is not None else b.get("token_amount")
+    tok_symbol = b.get("token_symbol") or token.get("symbol") or sym or ""
 
     buyer_full = str(b.get("buyer") or "")
     buyer_short = _short_addr(buyer_full)
@@ -1293,46 +1386,96 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     tg_link = token.get("telegram") or DEFAULT_TOKEN_TG
     trending = TRENDING_URL
 
-    lines: List[str] = []
-    lines.append(f"*{html.escape(title)} Buy!*")
-    lines.append("")
-    lines.append(f"💎 *{ton_amt:,.2f} TON*")
+
+    # ----- Premium message style (HTML) -----
+    # Buy strength diamonds (per-group setting)
+    gcfg = get_group(chat_id)
+    s = (gcfg.get("settings") or {})
+    strength = (s.get("strength") or "MED").upper()
+    if strength == "LOW":
+        thr = [0.2, 0.5, 1, 2, 5]
+    elif strength == "HIGH":
+        thr = [1, 2, 5, 10, 20]
+    else:
+        thr = [0.5, 1, 2, 5, 10]
+    diamonds = "💎" * sum(1 for t in thr if ton_amt >= t)
+
+    # Buyer clickable
+    buyer_line = ""
+    if buyer_full:
+        buyer_line = f'<a href="https://tonviewer.com/address/{html.escape(buyer_full)}">{html.escape(buyer_short)}</a>'
+
+    # Token amounts (dynamic decimals, never swap with TON)
+    tok_line = ""
     if tok_amt and tok_symbol:
+        def _fmt_amount(v: float) -> str:
+            av = abs(v)
+            if av >= 1_000_000:
+                d = 0
+            elif av >= 1_000:
+                d = 2
+            elif av >= 1:
+                d = 2
+            elif av >= 0.01:
+                d = 4
+            else:
+                d = 6
+            s = f"{v:,.{d}f}"
+            # trim trailing zeros
+            if "." in s:
+                s = s.rstrip("0").rstrip(".")
+            return s
+
         try:
-            tok_amt_f = float(tok_amt)
-            lines.append(f"🪙 *{tok_amt_f:,.0f} {html.escape(str(tok_symbol))}*")
+            _ta = float(tok_amt)
+            tok_line = f"🪙 <b>{_fmt_amount(_ta)} {html.escape(str(tok_symbol))}</b>"
         except Exception:
-            lines.append(f"🪙 *{html.escape(str(tok_amt))} {html.escape(str(tok_symbol))}*")
-    lines.append("")
-    lines.append(f"{html.escape(buyer_short)}")
+            tok_line = f"🪙 <b>{html.escape(str(tok_amt))} {html.escape(str(tok_symbol))}</b>"
+
+    # Build links row (keep only TX | GT | DexS | Telegram | Trending)
+ (keep only TX | GT | DexS | Telegram | Trending)
+    link_parts: List[str] = []
+    if tx_url:
+        link_parts.append(f'<a href="{html.escape(tx_url)}">TX</a>')
+    if gt_url:
+        link_parts.append(f'<a href="{html.escape(gt_url)}">GT</a>')
+    if dex_url:
+        link_parts.append(f'<a href="{html.escape(dex_url)}">DexS</a>')
+    if tg_link:
+        link_parts.append(f'<a href="{html.escape(tg_link)}">Telegram</a>')
+    if trending:
+        link_parts.append(f'<a href="{html.escape(trending)}">Trending</a>')
+    links_row = " | ".join(link_parts)
+
+    parts: List[str] = []
+    parts.append(f"<b>{html.escape(title)} Buy!</b>")
+    if diamonds:
+        parts.append(diamonds)
+    ton_price = get_ton_price_usd()
+    if ton_price:
+        parts.append(f"💎 <b>{ton_amt:,.2f} TON</b> (${ton_amt*ton_price:,.2f})")
+    else:
+        parts.append(f"💎 <b>{ton_amt:,.2f} TON</b>")
+    if tok_line:
+        parts.append(tok_line)
+    if buyer_line:
+        parts.append(buyer_line)
 
     # Stats
     if price_usd is not None:
-        lines.append(f"Price: ${price_usd:,.6f}")
+        parts.append(f"Price: ${price_usd:,.6f}")
     if liq_usd is not None:
-        lines.append(f"Liquidity: ${liq_usd:,.0f}")
+        parts.append(f"Liquidity: ${liq_usd:,.0f}")
     if mc_usd is not None:
-        lines.append(f"MCap: ${mc_usd:,.0f}")
+        parts.append(f"MCap: ${mc_usd:,.0f}")
     if holders is not None:
-        lines.append(f"Holders: {holders}")
+        parts.append(f"Holders: {holders}")
 
-    lines.append("")
-    # Keep only TX | GT | DexS | Telegram | Trending
-    link_parts: List[str] = []
-    if tx_url:
-        link_parts.append(f"[TX]({tx_url})")
-    if gt_url:
-        link_parts.append(f"[GT]({gt_url})")
-    if dex_url:
-        link_parts.append(f"[DexS]({dex_url})")
-    if tg_link:
-        link_parts.append(f"[Telegram]({tg_link})")
-    if trending:
-        link_parts.append(f"[Trending]({trending})")
-    if link_parts:
-        lines.append(" | ".join(link_parts))
+    if links_row:
+        parts.append(links_row)
 
-    msg = "\n".join(lines)
+    msg = "\n".join(parts)
+
 
     # Single buy button (dTrade referral + CA)
     ref = (DTRADE_REF or "https://t.me/dtrade?start=11TYq7LInG").rstrip("_")
@@ -1341,11 +1484,22 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Buy {sym or 'Token'} with dTrade", url=buy_url)]])
 
     try:
-        await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown", reply_markup=kb)
+        # Optional per-group media (photo/GIF) attached to every buy
+        gcfg = get_group(chat_id)
+        s = (gcfg.get("settings") or {})
+        media_id = s.get("media_file_id")
+        media_type = s.get("media_type")
+        if media_id:
+            if media_type == "animation":
+                await app.bot.send_animation(chat_id=chat_id, animation=media_id, caption=msg, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+            else:
+                await app.bot.send_photo(chat_id=chat_id, photo=media_id, caption=msg, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        else:
+            await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
     except Exception as e:
         # fallback without keyboard/markdown
         try:
-            await app.bot.send_message(chat_id=chat_id, text=msg.replace("*", ""))
+            await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML", disable_web_page_preview=True)
         except Exception:
             log.debug("send fail %s", e)
 

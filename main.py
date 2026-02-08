@@ -23,7 +23,7 @@ log = logging.getLogger("spyton_public")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
 TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io").strip().rstrip("/")
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "6.0"))
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2.0"))
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 DTRADE_REF = os.getenv("DTRADE_REF", "https://t.me/dtrade?start=11TYq7LInG").strip()
 TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/SpyTonTrending").strip()
@@ -223,7 +223,17 @@ SEEN: Dict[str, Any] = _load_json(SEEN_FILE, {})    # chat_id -> {dedupe_key: ts
 AWAITING: Dict[int, int] = {}
 
 # -------------------- HELPERS --------------------
-JETTON_RE = re.compile(r"\b([EU]Q[A-Za-z0-9_-]{40,80})\b")
+JETTON_RE = re.compile(r"(?<![A-Za-z0-9_-])([EU]Q[A-Za-z0-9_-]{40,120})(?![A-Za-z0-9_-])")
+
+# Deep-linking to DM for group configuration (Crypton-style)
+# Set BOT_USERNAME env to your bot username without @ (e.g. SpyTONPublicBuyBot)
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@").strip()
+
+def dm_cfg_url(chat_id: int) -> str:
+    """Open the bot DM with /start cfg_<chat_id>"""
+    if not BOT_USERNAME:
+        return ""
+    return f"https://t.me/{BOT_USERNAME}?start=cfg_{chat_id}"
 GECKO_POOL_RE = re.compile(r"geckoterminal\.com/ton/pools/([A-Za-z0-9_-]{20,120})", re.IGNORECASE)
 DEXSCREENER_PAIR_RE = re.compile(r"dexscreener\.com/ton/([A-Za-z0-9_-]{20,120})", re.IGNORECASE)
 STON_POOL_RE = re.compile(r"ston\.fi/[^\s]*?(?:pool|pools)/([A-Za-z0-9_-]{20,120})", re.IGNORECASE)
@@ -522,6 +532,17 @@ def _short_addr(a: str) -> str:
         return a
     return a[:4] + "…" + a[-4:]
 
+def _short_addr_safe(a: str) -> str:
+    """Shorten and strip non-alphanumerics for safe display."""
+    if not a:
+        return ""
+    clean = "".join(ch for ch in a if ch.isalnum())
+    if not clean:
+        clean = a
+    if len(clean) <= 10:
+        return clean
+    return clean[:4] + "…" + clean[-4:]
+
 def _to_float(x) -> float:
     try:
         return float(x)
@@ -660,6 +681,21 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if chat.type == "private":
+        # Deep-link DM config: /start cfg_<group_id>
+        if getattr(context, "args", None) and len(context.args) >= 1:
+            arg0 = (context.args[0] or "").strip()
+            if arg0.startswith("cfg_"):
+                try:
+                    gid = int(arg0.split("_", 1)[1])
+                    AWAITING[update.effective_user.id] = gid
+                    await update.message.reply_text(
+                        "Send the token CA (EQ…/UQ…) or a supported link (GT/DexS/STON/DeDust).\n\n"
+                        "You can also add the token Telegram link after the CA.\n"
+                        "Example: EQ... https://t.me/YourTokenTG"
+                    )
+                    return
+                except Exception:
+                    pass
         add_url = await build_add_to_group_url(context.application)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add BuyBot to Group", url=add_url)],
@@ -712,8 +748,21 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await is_admin(context.bot, chat.id, user.id):
             await q.answer("Admins only.", show_alert=True)
             return
-        AWAITING[user.id] = chat.id
-        await q.message.reply_text("Paste the token address (EQ… / UQ…) or a supported link.")
+        url = dm_cfg_url(chat.id)
+        if not url:
+            await q.message.reply_text(
+                "⚠️ BOT_USERNAME is not set on the server.\n\n"
+                "Set env `BOT_USERNAME` to your bot username, then try again."
+            )
+            return
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Configure in DM", url=url)]])
+        await q.message.reply_text(
+            "To configure safely (Crypton-style), use DM:\n"
+            "1) Tap *Configure in DM*\n"
+            "2) Send your token CA (and optional Telegram link)",
+            reply_markup=kb,
+            parse_mode="Markdown"
+        )
         return
 
     if data == "SET_GROUP":
@@ -983,7 +1032,7 @@ async def configure_group_token(chat_id: int, jetton: str, context: ContextTypes
             parse_mode="Markdown"
         )
         return
-    await _set_token_now(chat_id, jetton, context, reply_to_chat)
+    await _set_token_now(chat_id, jetton, tg_link, context, reply_to_chat)
 
 async def on_replace_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1010,7 +1059,7 @@ async def on_replace_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await is_admin(context.bot, chat.id, user.id):
             await q.answer("Admins only.", show_alert=True)
             return
-        await _set_token_now(target_chat_id, jetton, context, chat.id)
+        await _set_token_now(target_chat_id, jetton, tg_link, context, chat.id)
         try:
             await q.message.delete()
         except Exception:
@@ -1021,7 +1070,7 @@ async def on_replace_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Cancelled.")
         return
 
-async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_chat_id: int):
+async def _set_token_now(chat_id: int, jetton: str, tg_link: Optional[str], context: ContextTypes.DEFAULT_TYPE, reply_chat_id: int):
     # Token metadata (GeckoTerminal first, then TonAPI, then DexScreener)
     gk = gecko_token_info(jetton)
     name = (gk.get("name") or "").strip() if gk else ""
@@ -1038,16 +1087,37 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
     dedust_pool = find_dedust_ton_pair_for_token(jetton)
 
     g = get_group(chat_id)
+    # Save token config (1 token per group). We also set cursors so the bot does NOT spam old buys on first run.
+    now_ts = int(time.time())
+    # Initialize cursors to "start from now":
+    ston_cursor = None
+    dedust_cursor = None
+    if ston_pool:
+        try:
+            ston_cursor = int(await asyncio.to_thread(ston_latest_block))
+        except Exception:
+            ston_cursor = None
+    if dedust_pool:
+        try:
+            trades = await asyncio.to_thread(dedust_get_trades, dedust_pool, 1)
+            if trades:
+                # trade_id may be int-like string; store as string to keep JSON stable
+                dedust_cursor = str(trades[0].get("trade_id") or trades[0].get("id") or "") or None
+        except Exception:
+            dedust_cursor = None
+
     g["token"] = {
-        "address": jetton,
-        "name": name,
-        "symbol": sym,
+        "token_address": token_addr,
+        "symbol": token_symbol,
+        "name": token_name,
+        "telegram": tg_link,
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
-        "set_at": int(time.time()),
-        "last_ston_tx": None,
-        "last_dedust_trade": None,
-        "burst": {"window_start": int(time.time()), "count": 0},
+        "last_dedust_trade": dedust_cursor,
+        "ston_cursor": ston_cursor,
+        "set_at": now_ts,
+        "strength": g.get("strength", 1),
+        "media_file_id": g.get("media_file_id"),
     }
     save_groups()
 
@@ -1106,6 +1176,12 @@ async def poll_once(app: Application):
                     # initialize slightly behind to avoid missing
                     STON_LAST_BLOCK = max(0, int(latest) - 5)
                 from_b = int(STON_LAST_BLOCK) + 1
+                # Per-group cursor: if the token was just configured, skip older blocks so we don’t spam "old buys".
+                if token.get("ston_cursor") is not None:
+                    try:
+                        from_b = max(from_b, int(token["ston_cursor"]) + 1)
+                    except Exception:
+                        pass
                 to_b = int(latest)
                 # cap range to avoid huge pulls
                 if to_b - from_b > 60:
@@ -1183,6 +1259,7 @@ async def poll_once(app: Application):
                         save_groups()
                     except Exception as _e:
                         log.debug("STON v2 fallback err chat=%s %s", chat_id, _e)
+                token["ston_cursor"] = to_b
                 save_groups()
             except Exception as e:
                 log.debug("STON poll err chat=%s %s", chat_id, e)
@@ -1200,7 +1277,16 @@ async def poll_once(app: Application):
                     if not b:
                         continue
                     trade_id = str(b.get("trade_id") or b.get("tx") or "")
-                    if last_id and trade_id <= str(last_id):
+                    if last_id:
+                        try:
+                            if str(trade_id).isdigit() and str(last_id).isdigit():
+                                if int(trade_id) <= int(last_id):
+                                    continue
+                            else:
+                                if str(trade_id) <= str(last_id):
+                                    continue
+                        except Exception:
+                            pass
                         continue
                     ton_amt = float(b.get("ton") or 0.0)
                     if ton_amt < min_buy:
@@ -1232,11 +1318,11 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     title = sym or name or "TOKEN"
 
     ton_amt = float(b.get("ton") or 0.0)
-    tok_amt = b.get("token_amt")
+    tok_amt = b.get("token_amount", b.get("token_amt"))
     tok_symbol = b.get("token_symbol") or sym or ""
 
     buyer_full = str(b.get("buyer") or "")
-    buyer_short = _short_addr(buyer_full)
+    buyer_short = _short_addr_safe(buyer_full)
     buyer_url = f"https://tonviewer.com/address/{buyer_full}" if buyer_full else None
     tx = str(b.get("tx") or "")
 
@@ -1499,5 +1585,4 @@ def ensure_ton_leg_for_pool(token: Dict[str, Any]) -> Optional[int]:
         token["ton_leg"] = 1
         return 1
     return None
-
 

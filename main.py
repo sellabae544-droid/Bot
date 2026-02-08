@@ -1113,8 +1113,9 @@ async def poll_once(app: Application):
                 evs = await _to_thread(ston_events, from_b, to_b)
                 # advance cursor even if no events
                 STON_LAST_BLOCK = to_b
-                # filter swaps for this pool
+                # filter swaps for this pool (STON export feed)
                 ton_leg = ensure_ton_leg_for_pool(token)
+                posted_any = False
                 for ev in evs:
                     if (str(ev.get("eventType") or "").lower() != "swap"):
                         continue
@@ -1154,6 +1155,34 @@ async def poll_once(app: Application):
                         continue
                     burst["count"] += 1
                     await post_buy(app, chat_id, token, {"tx": tx, "buyer": maker, "ton": ton_spent, "token_amount": token_received}, source="STON.fi")
+                    posted_any = True
+
+                # Fallback for STON.fi v2 swaps (TonAPI tx actions).
+                # Some v2 pools don't appear in the export feed with matching pairId/fields,
+                # but TonAPI actions still include "Swap tokens" / "Stonfi Swap V2".
+                if not posted_any:
+                    try:
+                        txs = await _to_thread(tonapi_account_transactions, pool, 15)
+                        # process oldest -> newest
+                        txs = list(reversed(txs))
+                        for txo in txs:
+                            buys = stonfi_extract_buys_from_tonapi_tx(txo, token["address"])
+                            for b in buys:
+                                ton_spent = float(b.get("ton") or 0.0)
+                                if ton_spent < min_buy:
+                                    continue
+                                txh = str(b.get("tx") or "").strip() or _tx_hash(txo)
+                                buyer = str(b.get("buyer") or "").strip()
+                                dedupe_key = f"stonv2:{pool}:{txh}:{buyer}"
+                                if not dedupe_ok(chat_id, dedupe_key):
+                                    continue
+                                if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
+                                    continue
+                                burst["count"] += 1
+                                await post_buy(app, chat_id, token, {"tx": txh, "buyer": buyer, "ton": ton_spent, "token_amount": float(b.get("token_amount") or 0.0)}, source="STON.fi")
+                        save_groups()
+                    except Exception as _e:
+                        log.debug("STON v2 fallback err chat=%s %s", chat_id, _e)
                 save_groups()
             except Exception as e:
                 log.debug("STON poll err chat=%s %s", chat_id, e)

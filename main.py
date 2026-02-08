@@ -23,7 +23,7 @@ log = logging.getLogger("spyton_public")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
 TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io").strip().rstrip("/")
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2.0"))
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "6.0"))
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 DTRADE_REF = os.getenv("DTRADE_REF", "https://t.me/dtrade?start=11TYq7LInG").strip()
 TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/SpyTonTrending").strip()
@@ -223,17 +223,7 @@ SEEN: Dict[str, Any] = _load_json(SEEN_FILE, {})    # chat_id -> {dedupe_key: ts
 AWAITING: Dict[int, int] = {}
 
 # -------------------- HELPERS --------------------
-JETTON_RE = re.compile(r"(?<![A-Za-z0-9_-])([EU]Q[A-Za-z0-9_-]{40,120})(?![A-Za-z0-9_-])")
-
-# Deep-linking to DM for group configuration (Crypton-style)
-# Set BOT_USERNAME env to your bot username without @ (e.g. SpyTONPublicBuyBot)
-BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@").strip()
-
-def dm_cfg_url(chat_id: int) -> str:
-    """Open the bot DM with /start cfg_<chat_id>"""
-    if not BOT_USERNAME:
-        return ""
-    return f"https://t.me/{BOT_USERNAME}?start=cfg_{chat_id}"
+JETTON_RE = re.compile(r"\b([EU]Q[A-Za-z0-9_-]{40,80})\b")
 GECKO_POOL_RE = re.compile(r"geckoterminal\.com/ton/pools/([A-Za-z0-9_-]{20,120})", re.IGNORECASE)
 DEXSCREENER_PAIR_RE = re.compile(r"dexscreener\.com/ton/([A-Za-z0-9_-]{20,120})", re.IGNORECASE)
 STON_POOL_RE = re.compile(r"ston\.fi/[^\s]*?(?:pool|pools)/([A-Za-z0-9_-]{20,120})", re.IGNORECASE)
@@ -265,6 +255,41 @@ def save_groups():
 
 def save_seen():
     _save_json(SEEN_FILE, SEEN)
+
+
+
+BOT_USERNAME_CACHE = None
+
+async def get_bot_username(bot):
+    global BOT_USERNAME_CACHE
+    if BOT_USERNAME_CACHE:
+        return BOT_USERNAME_CACHE
+    me = await bot.get_me()
+    BOT_USERNAME_CACHE = me.username
+    return BOT_USERNAME_CACHE
+
+async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: str|None):
+    """Mark latest swaps as seen so the bot does not spam old buys right after configuration."""
+    try:
+        bucket = SEEN.setdefault(str(chat_id), {})
+        # STON.fi v2
+        if ston_pool:
+            swaps = await stonfi_latest_swaps(ston_pool, limit=25)
+            for s in swaps:
+                txhash = (s.get('tx_hash') or s.get('txHash') or s.get('hash') or '').strip()
+                if txhash:
+                    bucket[f"ston:{ston_pool}:{txhash}"] = int(time.time())
+        # DeDust
+        if dedust_pool:
+            trades = await dedust_latest_trades(dedust_pool, limit=25)
+            for t in trades:
+                txhash = (t.get('tx_hash') or t.get('txHash') or t.get('hash') or '').strip()
+                if txhash:
+                    bucket[f"dedust:{dedust_pool}:{txhash}"] = int(time.time())
+        save_seen()
+    except Exception:
+        # Warmup is best-effort; don't crash config flow
+        return
 
 def dedupe_ok(chat_id: int, key: str, ttl: int = 600) -> bool:
     now = int(time.time())
@@ -532,17 +557,6 @@ def _short_addr(a: str) -> str:
         return a
     return a[:4] + "…" + a[-4:]
 
-def _short_addr_safe(a: str) -> str:
-    """Shorten and strip non-alphanumerics for safe display."""
-    if not a:
-        return ""
-    clean = "".join(ch for ch in a if ch.isalnum())
-    if not clean:
-        clean = a
-    if len(clean) <= 10:
-        return clean
-    return clean[:4] + "…" + clean[-4:]
-
 def _to_float(x) -> float:
     try:
         return float(x)
@@ -681,21 +695,23 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if chat.type == "private":
-        # Deep-link DM config: /start cfg_<group_id>
-        if getattr(context, "args", None) and len(context.args) >= 1:
-            arg0 = (context.args[0] or "").strip()
-            if arg0.startswith("cfg_"):
+        # Deep-link from group "Click Here!" button: /start cfg_<group_id>
+        if context.args:
+            arg = str(context.args[0])
+            if arg.startswith("cfg_"):
                 try:
-                    gid = int(arg0.split("_", 1)[1])
-                    AWAITING[update.effective_user.id] = gid
+                    group_id = int(arg.split("_", 1)[1])
+                except Exception:
+                    group_id = None
+                if group_id:
+                    AWAITING[update.effective_user.id] = group_id
                     await update.message.reply_text(
-                        "Send the token CA (EQ…/UQ…) or a supported link (GT/DexS/STON/DeDust).\n\n"
-                        "You can also add the token Telegram link after the CA.\n"
+                        "✅ SpyTON BuyBot connected\n\n"
+                        "Please enter your token CA (EQ… / UQ…) or a supported link (GT/DexS/STON/DeDust).\n\n"
+                        "Tip: you can also add the token Telegram link after the CA.\n"
                         "Example: EQ... https://t.me/YourTokenTG"
                     )
                     return
-                except Exception:
-                    pass
         add_url = await build_add_to_group_url(context.application)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add BuyBot to Group", url=add_url)],
@@ -745,24 +761,19 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "CFG_GROUP":
+        # Crypton-style: group button opens DM config (deep-link) so you don't have to reply in group.
         if not await is_admin(context.bot, chat.id, user.id):
             await q.answer("Admins only.", show_alert=True)
             return
-        url = dm_cfg_url(chat.id)
-        if not url:
-            await q.message.reply_text(
-                "⚠️ BOT_USERNAME is not set on the server.\n\n"
-                "Set env `BOT_USERNAME` to your bot username, then try again."
-            )
-            return
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Configure in DM", url=url)]])
+        bot_username = await get_bot_username(context.bot)
+        deep = f"https://t.me/{bot_username}?start=cfg_{chat.id}"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Click Here!", url=deep)]])
         await q.message.reply_text(
-            "To configure safely (Crypton-style), use DM:\n"
-            "1) Tap *Configure in DM*\n"
-            "2) Send your token CA (and optional Telegram link)",
+            "To continue, click *Click Here!* and send your token CA in DM.",
+            parse_mode="Markdown",
             reply_markup=kb,
-            parse_mode="Markdown"
         )
+        await q.answer()
         return
 
     if data == "SET_GROUP":
@@ -1013,9 +1024,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # If user pressed configure, it's this chat anyway
         target_chat_id = chat.id
 
-    await configure_group_token(target_chat_id, addr, context, reply_to_chat=chat.id, tg_link=tg_link)
+    await configure_group_token(target_chat_id, addr, context, reply_to_chat=chat.id)
 
-async def configure_group_token(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_to_chat: int, tg_link: Optional[str] = None):
+async def configure_group_token(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_to_chat: int):
     g = get_group(chat_id)
     # 1 token per group: confirm replace if exists and different
     existing = g.get("token") or None
@@ -1025,7 +1036,6 @@ async def configure_group_token(chat_id: int, jetton: str, context: ContextTypes
             [InlineKeyboardButton("✅ Replace", callback_data=f"REPL_{chat_id}_{jetton}")],
             [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_REPL")]
         ])
-        context.user_data["pending_replace"] = {"chat_id": chat_id, "jetton": jetton, "tg_link": tg_link, "reply_to_chat": reply_to_chat}
         await context.bot.send_message(
             chat_id=reply_to_chat,
             text=f"This group already tracks *{existing.get('symbol') or existing.get('name') or 'a token'}*.\nReplace it with the new token?",
@@ -1033,7 +1043,7 @@ async def configure_group_token(chat_id: int, jetton: str, context: ContextTypes
             parse_mode="Markdown"
         )
         return
-    await _set_token_now(chat_id, jetton, tg_link, context, reply_to_chat)
+    await _set_token_now(chat_id, jetton, context, reply_to_chat)
 
 async def on_replace_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1045,23 +1055,523 @@ async def on_replace_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat or not user:
         return
 
-    pending = context.user_data.get("pending_replace")
-    if not pending:
-        await context.bot.send_message(chat_id=chat.id, text="No pending token to replace. Tap Configure Token again.")
+    data = q.data or ""
+    if data.startswith("REPL_"):
+        # REPL_chatid_jetton
+        parts = data.split("_", 2)
+        if len(parts) != 3:
+            return
+        target_chat_id = int(parts[1])
+        jetton = parts[2]
+        # ensure pressing inside that group and admin
+        if chat.id != target_chat_id:
+            await q.answer("Open this in the target group.", show_alert=True)
+            return
+        if not await is_admin(context.bot, chat.id, user.id):
+            await q.answer("Admins only.", show_alert=True)
+            return
+        await _set_token_now(target_chat_id, jetton, context, chat.id)
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
         return
 
-    chat_id = int(pending.get("chat_id"))
-    jetton = str(pending.get("jetton"))
-    tg_link = pending.get("tg_link")
-    reply_to_chat = int(pending.get("reply_to_chat", chat.id))
+    if data == "CANCEL_REPL":
+        await q.message.reply_text("Cancelled.")
+        return
 
-    # Clear pending before applying (avoid double clicks)
-    context.user_data.pop("pending_replace", None)
+async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_chat_id: int):
+    # Token metadata (GeckoTerminal first, then TonAPI, then DexScreener)
+    gk = gecko_token_info(jetton)
+    name = (gk.get("name") or "").strip() if gk else ""
+    sym = (gk.get("symbol") or "").strip() if gk else ""
+    if not name and not sym:
+        info = tonapi_jetton_info(jetton)
+        name = (info.get("name") or "").strip()
+        sym = (info.get("symbol") or "").strip()
+    if not name and not sym:
+        dx = dex_token_info(jetton)
+        name = (dx.get("name") or "").strip()
+        sym = (dx.get("symbol") or "").strip()
+    ston_pool = find_stonfi_ton_pair_for_token(jetton)
+    dedust_pool = find_dedust_ton_pair_for_token(jetton)
 
-    await _set_token_now(chat_id, jetton, tg_link, context, reply_to_chat)
+    g = get_group(chat_id)
+    g["token"] = {
+        "address": jetton,
+        "name": name,
+        "symbol": sym,
+        "ston_pool": ston_pool,
+        "dedust_pool": dedust_pool,
+        "set_at": int(time.time()),
+        "last_ston_tx": None,
+        "last_dedust_trade": None,
+        "burst": {"window_start": int(time.time()), "count": 0},
+    }
+    save_groups()
+
+    # Prevent posting old buys right after configuration
+    await warmup_seen_for_chat(chat_id, ston_pool, dedust_pool)
+
+    disp = sym or name or "TOKEN"
+    msg = (
+        f"✅ *Token Added*\n"
+        f"• Token: *{html.escape(disp)}*\n"
+        f"• Address: `{jetton}`\n"
+        f"• STON.fi pool: `{ston_pool or 'NONE'}`\n"
+        f"• DeDust pool: `{dedust_pool or 'NONE'}`\n\n"
+        f"Now posting buys automatically for this group.\n"
+        f"Use *Settings* to set buy strength & image."
+    )
+
+    await context.bot.send_message(
+        chat_id=reply_chat_id,
+        text=msg,
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
+    if reply_chat_id != chat_id:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=msg,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+
+# -------------------- TRACKERS --------------------
+async def _to_thread(fn, *args, **kwargs):
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
+async def poll_once(app: Application):
+    # Collect all groups with configured token
+    items: List[Tuple[int, Dict[str, Any]]] = []
+    for k, g in GROUPS.items():
+        if not isinstance(g, dict):
+            continue
+        token = g.get("token")
+        if not isinstance(token, dict):
+            continue
+        items.append((int(k), g))
+
+    # For each group, poll its pools
+    for chat_id, g in items:
+        token = g["token"]
+        settings = g.get("settings") or DEFAULT_SETTINGS
+        min_buy = float(settings.get("min_buy_ton") or 0.0)
+        anti = (settings.get("anti_spam") or "MED").upper()
+        max_msgs, window = anti_spam_limit(anti)
+
+        burst = token.setdefault("burst", {"window_start": int(time.time()), "count": 0})
+        now = int(time.time())
+        if now - int(burst.get("window_start", now)) > window:
+            burst["window_start"] = now
+            burst["count"] = 0
+
+        # STON (STON exported events by blocks)
+        if settings.get("enable_ston", True) and token.get("ston_pool"):
+            pool = token["ston_pool"]
+            try:
+                global STON_LAST_BLOCK
+                latest = await _to_thread(ston_latest_block)
+                if latest is None:
+                    raise RuntimeError("no latest block")
+                if STON_LAST_BLOCK is None:
+                    # initialize slightly behind to avoid missing
+                    STON_LAST_BLOCK = max(0, int(latest) - 5)
+                from_b = int(STON_LAST_BLOCK) + 1
+                to_b = int(latest)
+                # cap range to avoid huge pulls
+                if to_b - from_b > 60:
+                    from_b = to_b - 60
+                evs = await _to_thread(ston_events, from_b, to_b)
+                # advance cursor even if no events
+                STON_LAST_BLOCK = to_b
+                # filter swaps for this pool (STON export feed)
+                ton_leg = ensure_ton_leg_for_pool(token)
+                posted_any = False
+                for ev in evs:
+                    if (str(ev.get("eventType") or "").lower() != "swap"):
+                        continue
+                    pair_id = str(ev.get("pairId") or "").strip()
+                    if pair_id != pool:
+                        continue
+                    tx = str(ev.get("txnId") or "").strip()
+                    if not tx:
+                        continue
+                    maker = str(ev.get("maker") or "").strip()
+                    a0_in = _to_float(ev.get("amount0In"))
+                    a0_out = _to_float(ev.get("amount0Out"))
+                    a1_in = _to_float(ev.get("amount1In"))
+                    a1_out = _to_float(ev.get("amount1Out"))
+                    ton_spent = 0.0
+                    token_received = 0.0
+                    if ton_leg == 0:
+                        if a0_in > 0 and a1_out > 0:
+                            ton_spent = a0_in
+                            token_received = a1_out
+                        else:
+                            continue
+                    elif ton_leg == 1:
+                        if a1_in > 0 and a0_out > 0:
+                            ton_spent = a1_in
+                            token_received = a0_out
+                        else:
+                            continue
+                    else:
+                        continue
+                    if ton_spent < min_buy:
+                        continue
+                    dedupe_key = f"ston:{pool}:{tx}:{maker}"
+                    if not dedupe_ok(chat_id, dedupe_key):
+                        continue
+                    if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
+                        continue
+                    burst["count"] += 1
+                    await post_buy(app, chat_id, token, {"tx": tx, "buyer": maker, "ton": ton_spent, "token_amount": token_received}, source="STON.fi")
+                    posted_any = True
+
+                # Fallback for STON.fi v2 swaps (TonAPI tx actions).
+                # Some v2 pools don't appear in the export feed with matching pairId/fields,
+                # but TonAPI actions still include "Swap tokens" / "Stonfi Swap V2".
+                if not posted_any:
+                    try:
+                        txs = await _to_thread(tonapi_account_transactions, pool, 15)
+                        # process oldest -> newest
+                        txs = list(reversed(txs))
+                        for txo in txs:
+                            buys = stonfi_extract_buys_from_tonapi_tx(txo, token["address"])
+                            for b in buys:
+                                ton_spent = float(b.get("ton") or 0.0)
+                                if ton_spent < min_buy:
+                                    continue
+                                txh = str(b.get("tx") or "").strip() or _tx_hash(txo)
+                                buyer = str(b.get("buyer") or "").strip()
+                                dedupe_key = f"stonv2:{pool}:{txh}:{buyer}"
+                                if not dedupe_ok(chat_id, dedupe_key):
+                                    continue
+                                if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
+                                    continue
+                                burst["count"] += 1
+                                await post_buy(app, chat_id, token, {"tx": txh, "buyer": buyer, "ton": ton_spent, "token_amount": float(b.get("token_amount") or 0.0)}, source="STON.fi")
+                        save_groups()
+                    except Exception as _e:
+                        log.debug("STON v2 fallback err chat=%s %s", chat_id, _e)
+                save_groups()
+            except Exception as e:
+                log.debug("STON poll err chat=%s %s", chat_id, e)
+
+        # DeDust (DeDust API trades)
+        if settings.get("enable_dedust", True) and token.get("dedust_pool"):
+            pool = token["dedust_pool"]
+            try:
+                trades = await _to_thread(dedust_get_trades, pool, 25)
+                # process oldest -> newest
+                trades = list(reversed(trades))
+                last_id = token.get("last_dedust_trade")
+                for tr in trades:
+                    b = dedust_trade_to_buy(tr, token["address"])
+                    if not b:
+                        continue
+                    trade_id = str(b.get("trade_id") or b.get("tx") or "")
+                    if last_id and trade_id <= str(last_id):
+                        continue
+                    ton_amt = float(b.get("ton") or 0.0)
+                    if ton_amt < min_buy:
+                        continue
+                    dedupe_key = f"dedust:{pool}:{b.get('tx')}:{b.get('buyer')}"
+                    if not dedupe_ok(chat_id, dedupe_key):
+                        continue
+                    if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
+                        continue
+                    burst["count"] += 1
+                    await post_buy(app, chat_id, token, {
+                        "tx": b.get("tx"),
+                        "buyer": b.get("buyer"),
+                        "ton": ton_amt,
+                        "token_amount": float(b.get("token_amount") or 0.0),
+                    }, source="DeDust")
+                    token["last_dedust_trade"] = trade_id
+                save_groups()
+            except Exception as e:
+                log.debug("DeDust poll err chat=%s %s", chat_id, e)
+
+
+    # save seen occasionally
+    save_seen()
+
+async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dict[str, Any], source: str):
+    sym = (token.get("symbol") or "").strip()
+    name = (token.get("name") or "").strip()
+    title = sym or name or "TOKEN"
+
+    ton_amt = float(b.get("ton") or 0.0)
+    tok_amt = b.get("token_amt")
+    tok_symbol = b.get("token_symbol") or sym or ""
+
+    buyer_full = str(b.get("buyer") or "")
+    buyer_short = _short_addr(buyer_full)
+    buyer_url = f"https://tonviewer.com/address/{buyer_full}" if buyer_full else None
+    tx = str(b.get("tx") or "")
+
+    ston_pool = token.get("ston_pool") or ""
+    dedust_pool = token.get("dedust_pool") or ""
+    pool_for_market = ston_pool or dedust_pool
+
+    # Market data (prefer GeckoTerminal)
+    price_usd = liq_usd = mc_usd = None
+    if pool_for_market:
+        pinfo = gecko_pool_info(pool_for_market)
+        if pinfo:
+            try:
+                price_usd = float(pinfo.get("price_usd")) if pinfo.get("price_usd") is not None else None
+            except Exception:
+                price_usd = None
+            try:
+                liq_usd = float(pinfo.get("liquidity_usd")) if pinfo.get("liquidity_usd") is not None else None
+            except Exception:
+                liq_usd = None
+            try:
+                mc_usd = float(pinfo.get("market_cap_usd")) if pinfo.get("market_cap_usd") is not None else None
+            except Exception:
+                mc_usd = None
+
+    if (price_usd is None or mc_usd is None) and token.get("address"):
+        tinfo = gecko_token_info(token["address"])
+        if tinfo:
+            if price_usd is None:
+                try:
+                    price_usd = float(tinfo.get("price_usd")) if tinfo.get("price_usd") is not None else None
+                except Exception:
+                    pass
+            if mc_usd is None:
+                try:
+                    mc_usd = float(tinfo.get("market_cap_usd")) if tinfo.get("market_cap_usd") is not None else None
+                except Exception:
+                    pass
+
+    # Holders (best-effort via TonAPI)
+    holders = None
+    try:
+        info = tonapi_jetton_info(token.get("address") or "")
+        h = info.get("holders_count") if isinstance(info, dict) else None
+        if h is not None:
+            holders = int(h)
+    except Exception:
+        holders = None
+
+    # Links row
+    pair_for_links = pool_for_market or ""
+    tx_url = f"https://tonviewer.com/transaction/{tx}" if tx else None
+    gt_url = gecko_terminal_pool_url(pair_for_links) if pair_for_links else None
+    dex_url = f"https://dexscreener.com/ton/{pair_for_links}" if pair_for_links else None
+    tg_link = token.get("telegram") or DEFAULT_TOKEN_TG
+    trending = TRENDING_URL
+
+    lines: List[str] = []
+    lines.append(f"*{html.escape(title)} Buy!*")
+    lines.append("")
+    lines.append(f"💎 *{ton_amt:,.2f} TON*")
+    if tok_amt and tok_symbol:
+        try:
+            tok_amt_f = float(tok_amt)
+            lines.append(f"🪙 *{tok_amt_f:,.0f} {html.escape(str(tok_symbol))}*")
+        except Exception:
+            lines.append(f"🪙 *{html.escape(str(tok_amt))} {html.escape(str(tok_symbol))}*")
+    lines.append("")
+    # Buyer wallet clickable
+    if buyer_url:
+        lines.append(f"[{buyer_short}]({buyer_url})")
+    else:
+        lines.append(f"{buyer_short}")
+
+    # Stats
+    if price_usd is not None:
+        lines.append(f"Price: ${price_usd:,.6f}")
+    if liq_usd is not None:
+        lines.append(f"Liquidity: ${liq_usd:,.0f}")
+    if mc_usd is not None:
+        lines.append(f"MCap: ${mc_usd:,.0f}")
+    if holders is not None:
+        lines.append(f"Holders: {holders}")
+
+    lines.append("")
+    # Keep only TX | GT | DexS | Telegram | Trending
+    link_parts: List[str] = []
+    if tx_url:
+        link_parts.append(f"[TX]({tx_url})")
+    if gt_url:
+        link_parts.append(f"[GT]({gt_url})")
+    if dex_url:
+        link_parts.append(f"[DexS]({dex_url})")
+    if tg_link:
+        link_parts.append(f"[Telegram]({tg_link})")
+    if trending:
+        link_parts.append(f"[Trending]({trending})")
+    if link_parts:
+        lines.append(" | ".join(link_parts))
+
+    msg = "\n".join(lines)
+
+    # Single buy button (dTrade referral + CA)
+    ref = (DTRADE_REF or "https://t.me/dtrade?start=11TYq7LInG").rstrip("_")
+    ca = token.get("address") or ""
+    buy_url = f"{ref}_{ca}" if ca else ref
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Buy {sym or 'Token'} with dTrade", url=buy_url)]])
 
     try:
-        await q.edit_message_text("✅ Token replaced. The bot will start posting buys here.")
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=msg,
+            parse_mode="Markdown",
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        # fallback without keyboard/markdown
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=msg.replace("*", ""), disable_web_page_preview=True)
+        except Exception:
+            log.debug("send fail %s", e)
+
+async def tracker_loop(app: Application):
+    while True:
+        try:
+            await poll_once(app)
+        except Exception as e:
+            log.exception("tracker loop error: %s", e)
+        await asyncio.sleep(POLL_INTERVAL)
+
+# -------------------- Chat member welcome --------------------
+async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # when bot added to group, post premium intro
+    try:
+        my_chat_member = update.my_chat_member
+        if not my_chat_member:
+            return
+        chat = my_chat_member.chat
+        new = my_chat_member.new_chat_member
+        if chat.type not in ("group","supergroup"):
+            return
+        if new and new.status in ("member","administrator"):
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚙️ Configure Token", callback_data="CFG_GROUP")],
+                [InlineKeyboardButton("🛠 Settings", callback_data="SET_GROUP")],
+                [InlineKeyboardButton("📊 Status", callback_data="STATUS_GROUP")],
+            ])
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="✅ *SpyTON BuyBot connected*\nTap *Configure Token* to start posting buys.",
+                reply_markup=kb,
+                parse_mode="Markdown"
+            )
     except Exception:
-        pass
+        return
+
+# -------------------- HEALTH SERVER --------------------
+app_flask = Flask(__name__)
+
+@app_flask.get("/")
+def health():
+    return "ok", 200
+
+def run_flask():
+    port = int(os.getenv("PORT", "8080"))
+    app_flask.run(host="0.0.0.0", port=port)
+
+# -------------------- MAIN --------------------
+async def post_init(app: Application):
+    # start tracker
+    app.create_task(tracker_loop(app))
+    log.info("Tracker started.")
+
+def main():
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN is missing.")
+    application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+
+    application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(CallbackQueryHandler(on_replace_button, pattern=r"^(REPL_|CANCEL_REPL$)"))
+    application.add_handler(CallbackQueryHandler(on_button))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+
+    # flask in thread for Railway health
+    import threading
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    log.info("SpyTON Public BuyBot starting...")
+    application.run_polling(close_loop=False)
+
+if __name__ == "__main__":
+    main()
+# -------------------- STON API (exported events) --------------------
+STON_BASE = os.getenv("STON_BASE", "https://api.ston.fi").rstrip("/")
+STON_LATEST_BLOCK_URL = f"{STON_BASE}/export/dexscreener/v1/latest-block"
+STON_EVENTS_URL = f"{STON_BASE}/export/dexscreener/v1/events"
+STON_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+STON_LAST_BLOCK: Optional[int] = None
+
+def ston_latest_block() -> Optional[int]:
+    try:
+        r = requests.get(STON_LATEST_BLOCK_URL, headers=STON_HEADERS, timeout=20)
+        if r.status_code != 200:
+            return None
+        js = r.json()
+        if isinstance(js, dict):
+            v = js.get("block") or js.get("latestBlock") or js.get("latest_block")
+            if isinstance(v, int):
+                return v
+            if isinstance(v, str) and v.isdigit():
+                return int(v)
+        if isinstance(js, int):
+            return js
+        if isinstance(js, str) and js.isdigit():
+            return int(js)
+        return None
+    except Exception:
+        return None
+
+def ston_events(from_block: int, to_block: int) -> List[Dict[str, Any]]:
+    params = {"fromBlock": int(from_block), "toBlock": int(to_block)}
+    try:
+        r = requests.get(STON_EVENTS_URL, params=params, headers=STON_HEADERS, timeout=20)
+        if r.status_code != 200:
+            return []
+        js = r.json()
+        if isinstance(js, list):
+            return [x for x in js if isinstance(x, dict)]
+        if isinstance(js, dict) and isinstance(js.get("events"), list):
+            return [x for x in js["events"] if isinstance(x, dict)]
+        return []
+    except Exception:
+        return []
+
+def ensure_ton_leg_for_pool(token: Dict[str, Any]) -> Optional[int]:
+    # cache 0/1 where TON is leg0(amount0*) or leg1(amount1*)
+    tl = token.get("ton_leg")
+    if tl in (0,1):
+        return int(tl)
+    pool = token.get("ston_pool")
+    if not pool:
+        return None
+    meta = _dex_pair_lookup(pool)
+    if not isinstance(meta, dict):
+        return None
+    base = (meta.get("baseToken") or {})
+    quote = (meta.get("quoteToken") or {})
+    base_sym = str(base.get("symbol") or "").upper()
+    quote_sym = str(quote.get("symbol") or "").upper()
+    if base_sym == "TON":
+        token["ton_leg"] = 0
+        return 0
+    if quote_sym == "TON":
+        token["ton_leg"] = 1
+        return 1
+    return None
+
 

@@ -329,12 +329,12 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
 
         # DeDust (warmup by latest trade ids and tx hashes where available)
         if dedust_pool:
-            trades = await dedust_latest_trades(dedust_pool, limit=40)
+            trades = await dedust_latest_trades(dedust_pool, limit=60)
             for t in trades:
-                # baseline id (Dedust API usually has 'id' or 'lt')
-                tid = str(t.get("id") or t.get("lt") or t.get("trade_id") or "").strip()
-                if tid and (newest_dedust is None):
-                    newest_dedust = tid
+                # baseline LT (best) so we can skip history even if API has no timestamp
+                lt = str(t.get('lt') or '').strip()
+                if lt and newest_dedust is None:
+                    newest_dedust = lt
                 txhash = (t.get('tx_hash') or t.get('txHash') or t.get('hash') or '').strip()
                 if txhash:
                     bucket[f"dedust:{dedust_pool}:{txhash}"] = int(time.time())
@@ -347,6 +347,15 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
                 tok["last_ston_tx"] = newest_ston
             if newest_dedust:
                 tok["last_dedust_trade"] = newest_dedust
+            # baseline: ignore anything before now
+            tok["ignore_before_ts"] = int(time.time())
+            # baseline for STON export cursor: start from current latest block
+            try:
+                latest = await _to_thread(ston_latest_block)
+                if latest is not None:
+                    tok["ston_last_block"] = int(latest)
+            except Exception:
+                pass
             save_groups()
 
         save_seen()
@@ -1397,6 +1406,8 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "set_at": int(time.time()),
         "last_ston_tx": None,
         "last_dedust_trade": None,
+        "ston_last_block": None,
+        "ignore_before_ts": int(time.time()),
         "burst": {"window_start": int(time.time()), "count": 0},
         "telegram": telegram.strip() if telegram else "",
     }
@@ -1463,26 +1474,31 @@ async def poll_once(app: Application):
         if settings.get("enable_ston", True) and token.get("ston_pool"):
             pool = token["ston_pool"]
             try:
-                global STON_LAST_BLOCK
                 latest = await _to_thread(ston_latest_block)
                 if latest is None:
                     raise RuntimeError("no latest block")
-                if STON_LAST_BLOCK is None:
+                # per-token cursor to avoid posting old swaps when a new group configures a token
+                last_block = token.get("ston_last_block")
+                if last_block is None:
                     # initialize slightly behind to avoid missing
-                    STON_LAST_BLOCK = max(0, int(latest) - 5)
-                from_b = int(STON_LAST_BLOCK) + 1
+                    last_block = max(0, int(latest) - 5)
+                from_b = int(last_block) + 1
                 to_b = int(latest)
                 # cap range to avoid huge pulls
                 if to_b - from_b > 60:
                     from_b = to_b - 60
                 evs = await _to_thread(ston_events, from_b, to_b)
                 # advance cursor even if no events
-                STON_LAST_BLOCK = to_b
+                token["ston_last_block"] = to_b
                 # filter swaps for this pool (STON export feed)
                 ton_leg = ensure_ton_leg_for_pool(token)
                 posted_any = False
                 for ev in evs:
                     if (str(ev.get("eventType") or "").lower() != "swap"):
+                        continue
+                    ignore_before = int(token.get("ignore_before_ts") or 0)
+                    ev_ts = int(ev.get("timestamp") or ev.get("time") or ev.get("ts") or 0)
+                    if ignore_before and ev_ts and ev_ts < ignore_before:
                         continue
                     pair_id = str(ev.get("pairId") or "").strip()
                     if pair_id != pool:
@@ -1531,9 +1547,27 @@ async def poll_once(app: Application):
                         # process oldest -> newest
                         txs = list(reversed(txs))
                         for txo in txs:
+                            ignore_before = int(token.get("ignore_before_ts") or 0)
+                            ut = int(txo.get("utime") or 0)
+                            if ignore_before and ut and ut < ignore_before:
+                                continue
                             buys = stonfi_extract_buys_from_tonapi_tx(txo, token["address"])
                             for b in buys:
                                 ton_spent = float(b.get("ton") or 0.0)
+                                # TonAPI sometimes returns nanoTON
+                                if ton_spent > 1e5:
+                                    ton_spent = ton_spent / 1e9
+
+                                token_amt = float(b.get("token_amount") or 0.0)
+                                dec = token.get("decimals")
+                                try:
+                                    dec_i = int(dec) if dec is not None else None
+                                except Exception:
+                                    dec_i = None
+                                # TonAPI often returns jetton amount in minimal units
+                                if dec_i is not None and token_amt > 1e8:
+                                    token_amt = token_amt / (10 ** dec_i)
+
                                 if ton_spent < min_buy:
                                     continue
                                 txh = str(b.get("tx") or "").strip() or _tx_hash(txo)
@@ -1544,7 +1578,7 @@ async def poll_once(app: Application):
                                 if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
                                     continue
                                 burst["count"] += 1
-                                await post_buy(app, chat_id, token, {"tx": txh, "buyer": buyer, "ton": ton_spent, "token_amount": float(b.get("token_amount") or 0.0)}, source="STON.fi v2")
+                                await post_buy(app, chat_id, token, {"tx": txh, "buyer": buyer, "ton": ton_spent, "token_amount": token_amt}, source="STON.fi v2")
                         save_groups()
                     except Exception as _e:
                         log.debug("STON v2 fallback err chat=%s %s", chat_id, _e)
@@ -1559,14 +1593,24 @@ async def poll_once(app: Application):
                 trades = await _to_thread(dedust_get_trades, pool, 25)
                 # process oldest -> newest
                 trades = list(reversed(trades))
-                last_id = token.get("last_dedust_trade")
+                last_id = str(token.get('last_dedust_trade') or '').strip()
                 for tr in trades:
                     b = dedust_trade_to_buy(tr, token["address"])
                     if not b:
                         continue
-                    trade_id = str(b.get("trade_id") or b.get("tx") or "")
-                    if last_id and trade_id <= str(last_id):
+                    # Ignore old history right after token added
+                    ignore_before = int(token.get("ignore_before_ts") or 0)
+                    tr_ts = int(tr.get("timestamp") or tr.get("time") or tr.get("ts") or 0)
+                    if ignore_before and tr_ts and tr_ts < ignore_before:
                         continue
+                    # Prefer DeDust LT for ordering (most reliable)
+                    lt = str(tr.get('lt') or b.get('trade_id') or '').strip()
+                    if last_id and lt:
+                        try:
+                            if int(lt) <= int(last_id):
+                                continue
+                        except Exception:
+                            pass
                     ton_amt = float(b.get("ton") or 0.0)
                     if ton_amt < min_buy:
                         continue
@@ -1576,14 +1620,24 @@ async def poll_once(app: Application):
                     if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
                         continue
                     burst["count"] += 1
+                    token_amt = float(b.get("token_amount") or 0.0)
+                    dec = token.get("decimals")
+                    try:
+                        dec_i = int(dec) if dec is not None else None
+                    except Exception:
+                        dec_i = None
+                    if dec_i is not None and token_amt > 1e8:
+                        token_amt = token_amt / (10 ** dec_i)
+
                     await post_buy(app, chat_id, token, {
                         "tx": b.get("tx"),
-                        "trade_id": trade_id,
+                        "trade_id": lt,
                         "buyer": b.get("buyer"),
                         "ton": ton_amt,
-                        "token_amount": float(b.get("token_amount") or 0.0),
+                        "token_amount": token_amt,
                     }, source="DeDust")
-                    token["last_dedust_trade"] = trade_id
+                    token["last_dedust_trade"] = lt or token.get("last_dedust_trade")
+
                 save_groups()
             except Exception as e:
                 log.debug("DeDust poll err chat=%s %s", chat_id, e)

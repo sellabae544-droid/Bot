@@ -43,3 +43,8 @@ This version uses HTML parse mode to avoid Telegram Markdown errors.
 
 ### v8 change
 This version matches Crypton flow: /start in group -> Click Here button -> configure in private.
+
+
+### v10 fixes
+- 'Click Here!' opens private; if Telegram drops the deep-link parameter, /start in private now uses your last group automatically.
+- Removed BuyBot Guide button.

@@ -25,6 +25,10 @@ TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
 TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io").strip().rstrip("/")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "6.0"))
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
+DTRADE_REF = os.getenv("DTRADE_REF", "https://t.me/dtrade?start=11TYq7LInG").strip()
+TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/SpyTonTrending").strip()
+DEFAULT_TOKEN_TG = os.getenv("DEFAULT_TOKEN_TG", "https://t.me/SpyTonEco").strip()
+GECKO_BASE = os.getenv("GECKO_BASE", "https://api.geckoterminal.com/api/v2").strip().rstrip("/")
 
 DATA_FILE = os.getenv("GROUPS_FILE", "groups_public.json")
 SEEN_FILE = os.getenv("SEEN_FILE", "seen_public.json")
@@ -161,6 +165,57 @@ def tonapi_account_events(address: str, limit: int = 10) -> List[Dict[str, Any]]
     return ev if isinstance(ev, list) else []
 
 # -------------------- DEX PAIR LOOKUP --------------------
+
+# -------------------- GECKO TERMINAL --------------------
+def gecko_get(path: str, params: Optional[dict] = None) -> Optional[dict]:
+    """GeckoTerminal public API (best-effort)."""
+    try:
+        url = f"{GECKO_BASE}{path}"
+        r = requests.get(
+            url,
+            params=params or {},
+            headers={
+                "accept": "application/json",
+                "user-agent": "SpyTONBuyBot/1.0",
+            },
+            timeout=12,
+        )
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+def gecko_token_info(token_addr: str) -> Optional[dict]:
+    # token_addr should be a jetton master (EQ.. / UQ..)
+    j = gecko_get(f"/networks/ton/tokens/{token_addr}")
+    if not j or "data" not in j:
+        return None
+    attrs = (j.get("data") or {}).get("attributes") or {}
+    return {
+        "name": attrs.get("name") or "",
+        "symbol": attrs.get("symbol") or "",
+        "decimals": attrs.get("decimals"),
+        "price_usd": attrs.get("price_usd"),
+        "market_cap_usd": attrs.get("market_cap_usd") or attrs.get("fdv_usd"),
+    }
+
+def gecko_pool_info(pool_addr: str) -> Optional[dict]:
+    j = gecko_get(f"/networks/ton/pools/{pool_addr}")
+    if not j or "data" not in j:
+        return None
+    attrs = (j.get("data") or {}).get("attributes") or {}
+    return {
+        "price_usd": attrs.get("base_token_price_usd") or attrs.get("price_usd"),
+        "liquidity_usd": attrs.get("reserve_in_usd") or attrs.get("liquidity_usd"),
+        "fdv_usd": attrs.get("fdv_usd"),
+        "market_cap_usd": attrs.get("market_cap_usd") or attrs.get("fdv_usd"),
+        "name": attrs.get("name"),
+    }
+
+def gecko_terminal_pool_url(pool_addr: str) -> str:
+    return f"https://www.geckoterminal.com/ton/pools/{pool_addr}"
+
 def find_pair_for_token_on_dex(token_address: str, want_dex: str) -> Optional[str]:
     url = f"{DEX_TOKEN_URL}/{token_address}"
     try:
@@ -229,6 +284,74 @@ def find_stonfi_ton_pair_for_token(token_address: str) -> Optional[str]:
 
 def find_dedust_ton_pair_for_token(token_address: str) -> Optional[str]:
     return find_pair_for_token_on_dex(token_address, "dedust")
+
+def dex_token_info(token_address: str) -> Dict[str, str]:
+    """Fallback metadata from Dexscreener.
+
+    DexScreener often has token name/symbol even when TonAPI metadata is missing.
+    We pick the TON pair with best liquidity/volume and read the non-TON side.
+    """
+    out = {"name": "", "symbol": ""}
+    try:
+        g = gecko_token_info(token_address)
+        if g:
+            out["name"] = g.get("name") or out["name"]
+            out["symbol"] = g.get("symbol") or out["symbol"]
+            if out["name"] or out["symbol"]:
+                return out
+        res = requests.get(f"{DEX_TOKEN_URL}/{token_address}", timeout=20)
+        if res.status_code != 200:
+            return out
+        js = res.json()
+        pairs = js.get("pairs") if isinstance(js, dict) else None
+        if not isinstance(pairs, list) or not pairs:
+            return out
+
+        best = None
+        best_score = -1.0
+        for p in pairs:
+            if not isinstance(p, dict):
+                continue
+            if (p.get("chainId") or "").lower() != "ton":
+                continue
+            base = p.get("baseToken") or {}
+            quote = p.get("quoteToken") or {}
+            base_sym = (base.get("symbol") or "").upper()
+            quote_sym = (quote.get("symbol") or "").upper()
+            if base_sym != "TON" and quote_sym != "TON":
+                continue
+            liq = 0.0
+            vol = 0.0
+            try:
+                liq = float(((p.get("liquidity") or {}).get("usd") or 0) or 0)
+            except Exception:
+                liq = 0.0
+            try:
+                vol = float(((p.get("volume") or {}).get("h24") or 0) or 0)
+            except Exception:
+                vol = 0.0
+            score = liq * 1_000_000 + vol
+            if score > best_score:
+                best_score = score
+                best = p
+
+        if not best:
+            best = pairs[0]
+
+        base = best.get("baseToken") or {}
+        quote = best.get("quoteToken") or {}
+        base_addr = str(base.get("address") or "")
+        quote_addr = str(quote.get("address") or "")
+        # Choose the side that matches the token_address if possible
+        tok = base if base_addr == token_address else (quote if quote_addr == token_address else None)
+        if not tok:
+            # Otherwise choose non-TON side
+            tok = quote if (str(base.get("symbol") or "").upper() == "TON") else base
+        out["name"] = str(tok.get("name") or "").strip()
+        out["symbol"] = str(tok.get("symbol") or "").strip()
+        return out
+    except Exception:
+        return out
 
 # -------------------- BUY EXTRACTION (simplified from your working bot) --------------------
 def _tx_hash(tx: Dict[str, Any]) -> str:
@@ -744,9 +867,18 @@ async def on_replace_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_chat_id: int):
-    info = tonapi_jetton_info(jetton)
-    name = info.get("name") or ""
-    sym = info.get("symbol") or ""
+    # Token metadata (GeckoTerminal first, then TonAPI, then DexScreener)
+    gk = gecko_token_info(jetton)
+    name = (gk.get("name") or "").strip() if gk else ""
+    sym = (gk.get("symbol") or "").strip() if gk else ""
+    if not name and not sym:
+        info = tonapi_jetton_info(jetton)
+        name = (info.get("name") or "").strip()
+        sym = (info.get("symbol") or "").strip()
+    if not name and not sym:
+        dx = dex_token_info(jetton)
+        name = (dx.get("name") or "").strip()
+        sym = (dx.get("symbol") or "").strip()
     ston_pool = find_stonfi_ton_pair_for_token(jetton)
     dedust_pool = find_dedust_ton_pair_for_token(jetton)
 
@@ -873,22 +1005,128 @@ async def poll_once(app: Application):
     save_seen()
 
 async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dict[str, Any], source: str):
-    sym = token.get("symbol") or token.get("name") or "TOKEN"
+    sym = (token.get("symbol") or "").strip()
+    name = (token.get("name") or "").strip()
+    title = sym or name or "TOKEN"
+
     ton_amt = float(b.get("ton") or 0.0)
-    buyer = _short_addr(str(b.get("buyer") or ""))
+    tok_amt = b.get("token_amt")
+    tok_symbol = b.get("token_symbol") or sym or ""
+
+    buyer_full = str(b.get("buyer") or "")
+    buyer_short = _short_addr(buyer_full)
     tx = str(b.get("tx") or "")
-    # simple message; you can upgrade style later
-    msg = (
-        f"🟢 *BUY* — {html.escape(sym)}\n"
-        f"💎 *{ton_amt:.4f} TON*\n"
-        f"👤 {buyer}\n"
-        f"🔎 Source: {source}\n"
-        f"🔗 Tx: `{tx}`"
-    )
+
+    ston_pool = token.get("ston_pool") or ""
+    dedust_pool = token.get("dedust_pool") or ""
+    pool_for_market = ston_pool or dedust_pool
+
+    # Market data (prefer GeckoTerminal)
+    price_usd = liq_usd = mc_usd = None
+    if pool_for_market:
+        pinfo = gecko_pool_info(pool_for_market)
+        if pinfo:
+            try:
+                price_usd = float(pinfo.get("price_usd")) if pinfo.get("price_usd") is not None else None
+            except Exception:
+                price_usd = None
+            try:
+                liq_usd = float(pinfo.get("liquidity_usd")) if pinfo.get("liquidity_usd") is not None else None
+            except Exception:
+                liq_usd = None
+            try:
+                mc_usd = float(pinfo.get("market_cap_usd")) if pinfo.get("market_cap_usd") is not None else None
+            except Exception:
+                mc_usd = None
+
+    if (price_usd is None or mc_usd is None) and token.get("address"):
+        tinfo = gecko_token_info(token["address"])
+        if tinfo:
+            if price_usd is None:
+                try:
+                    price_usd = float(tinfo.get("price_usd")) if tinfo.get("price_usd") is not None else None
+                except Exception:
+                    pass
+            if mc_usd is None:
+                try:
+                    mc_usd = float(tinfo.get("market_cap_usd")) if tinfo.get("market_cap_usd") is not None else None
+                except Exception:
+                    pass
+
+    # Holders (best-effort via TonAPI)
+    holders = None
     try:
-        await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+        info = tonapi_jetton_info(token.get("address") or "")
+        h = info.get("holders_count") if isinstance(info, dict) else None
+        if h is not None:
+            holders = int(h)
+    except Exception:
+        holders = None
+
+    # Links row
+    pair_for_links = pool_for_market or ""
+    tx_url = f"https://tonviewer.com/transaction/{tx}" if tx else None
+    gt_url = gecko_terminal_pool_url(pair_for_links) if pair_for_links else None
+    dex_url = f"https://dexscreener.com/ton/{pair_for_links}" if pair_for_links else None
+    tg_link = token.get("telegram") or DEFAULT_TOKEN_TG
+    trending = TRENDING_URL
+
+    lines: List[str] = []
+    lines.append(f"*{html.escape(title)} Buy!*")
+    lines.append("")
+    lines.append(f"💎 *{ton_amt:,.2f} TON*")
+    if tok_amt and tok_symbol:
+        try:
+            tok_amt_f = float(tok_amt)
+            lines.append(f"🪙 *{tok_amt_f:,.0f} {html.escape(str(tok_symbol))}*")
+        except Exception:
+            lines.append(f"🪙 *{html.escape(str(tok_amt))} {html.escape(str(tok_symbol))}*")
+    lines.append("")
+    lines.append(f"{html.escape(buyer_short)}")
+
+    # Stats
+    if price_usd is not None:
+        lines.append(f"Price: ${price_usd:,.6f}")
+    if liq_usd is not None:
+        lines.append(f"Liquidity: ${liq_usd:,.0f}")
+    if mc_usd is not None:
+        lines.append(f"MCap: ${mc_usd:,.0f}")
+    if holders is not None:
+        lines.append(f"Holders: {holders}")
+
+    lines.append("")
+    # Keep only TX | GT | DexS | Telegram | Trending
+    link_parts: List[str] = []
+    if tx_url:
+        link_parts.append(f"[TX]({tx_url})")
+    if gt_url:
+        link_parts.append(f"[GT]({gt_url})")
+    if dex_url:
+        link_parts.append(f"[DexS]({dex_url})")
+    if tg_link:
+        link_parts.append(f"[Telegram]({tg_link})")
+    if trending:
+        link_parts.append(f"[Trending]({trending})")
+    if link_parts:
+        lines.append(" | ".join(link_parts))
+
+    msg = "
+".join(lines)
+
+    # Single buy button (dTrade referral + CA)
+    ref = (DTRADE_REF or "https://t.me/dtrade?start=11TYq7LInG").rstrip("_")
+    ca = token.get("address") or ""
+    buy_url = f"{ref}_{ca}" if ca else ref
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Buy {sym or 'Token'} with dTrade", url=buy_url)]])
+
+    try:
+        await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown", reply_markup=kb)
     except Exception as e:
-        log.debug("send fail %s", e)
+        # fallback without keyboard/markdown
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=msg.replace("*", ""))
+        except Exception:
+            log.debug("send fail %s", e)
 
 async def tracker_loop(app: Application):
     while True:

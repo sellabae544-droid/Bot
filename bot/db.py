@@ -22,45 +22,46 @@ class TokenCfg:
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL;")
+        # sqlite only allows one statement per execute()
         await db.execute(
-            """CREATE TABLE IF NOT EXISTS chats (
-                chat_id INTEGER PRIMARY KEY,
-                active_token_id INTEGER
+            """CREATE TABLE IF NOT EXISTS user_sessions (
+                user_id INTEGER PRIMARY KEY,
+                target_chat_id INTEGER NOT NULL
             );"""
         )
         await db.execute(
-            """CREATE TABLE IF NOT EXISTS user_sessions (
-    user_id INTEGER PRIMARY KEY,
-    target_chat_id INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS tokens (
+            """CREATE TABLE IF NOT EXISTS tokens (
                 token_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
                 token_address TEXT NOT NULL,
                 token_symbol TEXT,
                 token_name TEXT,
-                token_telegram TEXT,
-                emoji TEXT NOT NULL DEFAULT '🟩',
+                emoji TEXT DEFAULT '🟩',
                 media_file_id TEXT,
-                min_ton REAL NOT NULL DEFAULT 0,
-                last_trade_id TEXT,
-                leaderboard_message_id INTEGER,
-                UNIQUE(chat_id, token_address)
+                min_ton REAL DEFAULT 0,
+                token_telegram TEXT,
+                is_active INTEGER DEFAULT 1,
+                created_at INTEGER DEFAULT (strftime('%s','now'))
             );"""
         )
         await db.execute(
-            """CREATE TABLE IF NOT EXISTS stats (
+            """CREATE TABLE IF NOT EXISTS leaderboard (
                 token_id INTEGER NOT NULL,
-                buyer TEXT NOT NULL,
+                buyer_address TEXT NOT NULL,
                 ton_total REAL NOT NULL DEFAULT 0,
-                buy_count INTEGER NOT NULL DEFAULT 0,
-                last_ts INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (token_id, buyer)
+                last_tx_hash TEXT,
+                updated_at INTEGER DEFAULT (strftime('%s','now')),
+                PRIMARY KEY (token_id, buyer_address)
+            );"""
+        )
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS leaderboard_messages (
+                chat_id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL
             );"""
         )
         await db.commit()
+
 
 async def ensure_chat(chat_id: int):
     async with aiosqlite.connect(DB_PATH) as db:

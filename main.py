@@ -249,6 +249,8 @@ SEEN: Dict[str, Any] = _load_json(SEEN_FILE, {})    # chat_id -> {dedupe_key: ts
 AWAITING: Dict[int, int] = {}
 # user_id -> chat_id awaiting media upload (photo/gif)
 AWAITING_MEDIA: Dict[int, int] = {}
+PENDING_REPLY: Dict[int, int] = {}  # chat_id -> message_id to reply to for token input (privacy-mode safe)
+PENDING_USER: Dict[int, int] = {}   # chat_id -> user_id who initiated configure
 
 # -------------------- HELPERS --------------------
 JETTON_RE = re.compile(r"\b([EU]Q[A-Za-z0-9_-]{40,80})\b")
@@ -741,7 +743,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Admins only.", show_alert=True)
             return
         AWAITING[user.id] = chat.id
-        await q.message.reply_text("Paste the token address (EQ… / UQ…) or a supported link.")
+        # Privacy-mode safe: ask user to *reply* with the token address/link
+        from telegram import ForceReply
+        msg = await q.message.reply_text(
+            "Reply to this message with the token address (EQ…/UQ…) or a supported link (GT/DexS/STON/DeDust).",
+            reply_markup=ForceReply(selective=True)
+        )
+        PENDING_REPLY[chat.id] = msg.message_id
+        PENDING_USER[chat.id] = user.id
         return
 
     if data == "SET_GROUP":
@@ -1059,12 +1068,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     else:
         # in group: only admins can configure
+        # In group: only admins can configure.
+        # If the bot privacy mode is ON, it will only receive messages that are replies.
+        pending_mid = PENDING_REPLY.get(chat.id)
+        pending_uid = PENDING_USER.get(chat.id)
+        if pending_mid:
+            # require reply to the bot prompt, and (optionally) same user who initiated it
+            if not update.message.reply_to_message or update.message.reply_to_message.message_id != pending_mid:
+                return
+            if pending_uid and user.id != pending_uid:
+                return
         if not await is_admin(context.bot, chat.id, user.id):
             return
         # If user pressed configure, it's this chat anyway
         target_chat_id = chat.id
 
     await configure_group_token(target_chat_id, addr, context, reply_to_chat=chat.id, token_tg=tg_in)
+    PENDING_REPLY.pop(target_chat_id, None)
+    PENDING_USER.pop(target_chat_id, None)
 
 async def configure_group_token(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_to_chat: int, token_tg: Optional[str] = None):
     g = get_group(chat_id)

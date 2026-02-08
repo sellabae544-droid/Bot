@@ -1110,8 +1110,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     if link_parts:
         lines.append(" | ".join(link_parts))
 
-    msg = "
-".join(lines)
+    msg = "\n".join(lines)
 
     # Single buy button (dTrade referral + CA)
     ref = (DTRADE_REF or "https://t.me/dtrade?start=11TYq7LInG").rstrip("_")

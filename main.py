@@ -690,7 +690,8 @@ async def build_private_config_url(application: Application, chat_id: int) -> st
     try:
         me = await application.bot.get_me()
         if me and me.username:
-            return f"https://t.me/{me.username}?start=cfg_{chat_id}"
+            gid_enc = f"n{abs(int(chat_id))}" if int(chat_id) < 0 else f"p{int(chat_id)}"
+            return f"https://t.me/{me.username}?start=cfg_{gid_enc}"
     except Exception:
         pass
     return "https://t.me/"
@@ -708,7 +709,13 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             arg0 = str(context.args[0])
             if arg0.startswith("cfg_"):
                 try:
-                    target_gid = int(arg0.split("_", 1)[1])
+                    gid_raw = arg0.split("_", 1)[1]
+                    if gid_raw.startswith("n"):
+                        target_gid = -int(gid_raw[1:])
+                    elif gid_raw.startswith("p"):
+                        target_gid = int(gid_raw[1:])
+                    else:
+                        target_gid = int(gid_raw)
                     AWAITING[user.id] = target_gid
                     context.user_data["pending_cfg_group"] = target_gid
                     await update.message.reply_text(

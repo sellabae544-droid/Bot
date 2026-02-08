@@ -872,8 +872,8 @@ async def send_settings(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg, e
         f"• Burst mode: *{burst}*\n"
         f"• Anti-spam: *{anti}*\n"
         f"• Min buy (TON): *{min_buy}*\n"
-        f"• Buy strength: *{(s.get(\'strength\') or \'MED\').upper()}*\n"
-        f"• Media: *{\'SET ✅\' if s.get(\'media_file_id\') else \'NONE\'}*\n"
+        f"• Buy strength: *{(s.get('strength') or 'MED').upper()}*\n"
+        f"• Media: *{'SET ✅' if s.get('media_file_id') else 'NONE'}*\n"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"STON.fi: {ston}", callback_data="TOG_STON"),

@@ -1,11 +1,11 @@
 
-import os, json, time, asyncio, logging, re, html
+import os, json, time, asyncio, logging, re, html, base64
 from typing import Any, Dict, Optional, List, Tuple
 from urllib.parse import urlparse
 import requests
 
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
     Application, ApplicationBuilder,
     CommandHandler, CallbackQueryHandler,
@@ -201,6 +201,17 @@ DEFAULT_SETTINGS = {
     "min_buy_ton": 0.0,
     "anti_spam": "MED",   # LOW | MED | HIGH
     "burst_mode": True,
+
+    # Crypton-style options
+    "strength_on": True,
+    "strength_emoji": "🟢",
+    "strength_step_ton": 5.0,   # 1 strength unit per X TON
+    "strength_max": 30,         # max emojis
+
+    # Optional buy alert image
+    # If enabled and a file_id is set, the bot will send a Telegram photo (not a link).
+    "buy_image_on": False,
+    "buy_image_file_id": "",
 }
 
 def _load_json(path: str, default):
@@ -221,6 +232,9 @@ SEEN: Dict[str, Any] = _load_json(SEEN_FILE, {})    # chat_id -> {dedupe_key: ts
 
 # user_id -> chat_id awaiting token paste
 AWAITING: Dict[int, int] = {}
+
+# user_id -> chat_id awaiting buy image photo
+AWAITING_IMAGE: Dict[int, int] = {}
 
 # -------------------- HELPERS --------------------
 JETTON_RE = re.compile(r"\b([EU]Q[A-Za-z0-9_-]{40,80})\b")
@@ -336,14 +350,26 @@ def tonapi_get(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Di
     js = tonapi_get_raw(url, params=params)
     return js if isinstance(js, dict) else None
 
-def tonapi_jetton_info(jetton: str) -> Dict[str, str]:
-    out = {"name": "", "symbol": ""}
+def tonapi_jetton_info(jetton: str) -> Dict[str, Any]:
+    """Fetch basic jetton metadata from TonAPI.
+
+    We keep this as a small dict used across the bot. TonAPI responses often
+    include holders_count at the top-level.
+    """
+    out: Dict[str, Any] = {"name": "", "symbol": "", "holders_count": None}
     js = tonapi_get(f"{TONAPI_BASE}/v2/jettons/{jetton}")
     if not js:
         return out
     meta = js.get("metadata") or {}
     out["name"] = str(meta.get("name") or js.get("name") or "").strip()
     out["symbol"] = str(meta.get("symbol") or js.get("symbol") or "").strip()
+    # TonAPI commonly exposes holders_count at top-level
+    try:
+        hc = js.get("holders_count")
+        if hc is not None:
+            out["holders_count"] = int(hc)
+    except Exception:
+        pass
     return out
 
 def tonapi_account_transactions(address: str, limit: int = 12) -> List[Dict[str, Any]]:
@@ -547,6 +573,30 @@ def dex_token_info(token_address: str) -> Dict[str, str]:
 def _tx_hash(tx: Dict[str, Any]) -> str:
     return str(tx.get("hash") or tx.get("tx_hash") or tx.get("id") or "")
 
+def _normalize_tx_hash_to_hex(h: Any) -> str:
+    """Return a 64-char lowercase hex tx hash when possible.
+
+    Tonviewer transaction link format: https://tonviewer.com/transaction/<hash as hex>.
+    Some APIs return base64url-encoded 32-byte hashes; we convert those to hex.
+    """
+    if h is None:
+        return ""
+    s = str(h).strip()
+    if not s:
+        return ""
+    # Already hex?
+    if re.fullmatch(r"[0-9a-fA-F]{64}", s):
+        return s.lower()
+    # If looks like base64url, try decode -> 32 bytes
+    try:
+        pad = "=" * ((4 - (len(s) % 4)) % 4)
+        b = base64.urlsafe_b64decode(s + pad)
+        if isinstance(b, (bytes, bytearray)) and len(b) == 32:
+            return bytes(b).hex()
+    except Exception:
+        pass
+    return ""
+
 def _action_type(a: Dict[str, Any]) -> str:
     return str(a.get("type") or a.get("action") or a.get("name") or "")
 
@@ -640,7 +690,8 @@ def stonfi_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> L
 def dedust_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
     """TonAPI events endpoint sometimes provides swap action info too."""
     out: List[Dict[str, Any]] = []
-    tx_hash = str(ev.get("event_id") or ev.get("id") or ev.get("hash") or "")
+    # Prefer real transaction hash when present (hex or base64url). Fall back to event id.
+    tx_hash = str(ev.get("hash") or ev.get("tx_hash") or ev.get("transaction_hash") or ev.get("id") or ev.get("event_id") or "")
     actions = ev.get("actions")
     if not isinstance(actions, list):
         actions = []
@@ -795,6 +846,30 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s["enable_dedust"] = not bool(s.get("enable_dedust", True))
         elif data == "TOG_BURST":
             s["burst_mode"] = not bool(s.get("burst_mode", True))
+        elif data == "TOG_STRENGTH":
+            s["strength_on"] = not bool(s.get("strength_on", True))
+        elif data == "TOG_IMAGE":
+            s["buy_image_on"] = not bool(s.get("buy_image_on", False))
+        save_groups()
+        await send_settings(chat.id, context, q.message, edit=True)
+        return
+
+    if data == "IMG_SET":
+        if not await is_admin(context.bot, chat.id, user.id):
+            await q.answer("Admins only.", show_alert=True)
+            return
+        # Next photo from this admin will be saved as the buy image for this group.
+        AWAITING_IMAGE[user.id] = chat.id
+        await q.message.reply_text("Send the *buy image* now as a Telegram photo (not a file).", parse_mode="Markdown")
+        return
+
+    if data == "IMG_CLEAR":
+        if not await is_admin(context.bot, chat.id, user.id):
+            await q.answer("Admins only.", show_alert=True)
+            return
+        g = get_group(chat.id)
+        g["settings"]["buy_image_file_id"] = ""
+        g["settings"]["buy_image_on"] = False
         save_groups()
         await send_settings(chat.id, context, q.message, edit=True)
         return
@@ -807,6 +882,46 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s = g["settings"]
         val = float(data.split("_",1)[1])
         s["min_buy_ton"] = val
+        save_groups()
+        await send_settings(chat.id, context, q.message, edit=True)
+        return
+
+    if data.startswith("STEP_"):
+        if not await is_admin(context.bot, chat.id, user.id):
+            await q.answer("Admins only.", show_alert=True)
+            return
+        g = get_group(chat.id)
+        s = g["settings"]
+        step = float(data.split("_", 1)[1])
+        s["strength_step_ton"] = step
+        save_groups()
+        await send_settings(chat.id, context, q.message, edit=True)
+        return
+
+    if data.startswith("MAX_"):
+        if not await is_admin(context.bot, chat.id, user.id):
+            await q.answer("Admins only.", show_alert=True)
+            return
+        g = get_group(chat.id)
+        s = g["settings"]
+        mx = int(data.split("_", 1)[1])
+        s["strength_max"] = mx
+        save_groups()
+        await send_settings(chat.id, context, q.message, edit=True)
+        return
+
+    if data.startswith("EMO_"):
+        if not await is_admin(context.bot, chat.id, user.id):
+            await q.answer("Admins only.", show_alert=True)
+            return
+        g = get_group(chat.id)
+        s = g["settings"]
+        if data == "EMO_GREEN":
+            s["strength_emoji"] = "🟢"
+        elif data == "EMO_PLANE":
+            s["strength_emoji"] = "✈️"
+        elif data == "EMO_DIAMOND":
+            s["strength_emoji"] = "💎"
         save_groups()
         await send_settings(chat.id, context, q.message, edit=True)
         return
@@ -864,6 +979,16 @@ async def send_settings(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg, e
     anti = (s.get("anti_spam") or "MED").upper()
     min_buy = s.get("min_buy_ton", 0.0)
 
+    strength = "ON ✅" if s.get("strength_on", True) else "OFF ❌"
+    strength_step = float(s.get("strength_step_ton") or 5.0)
+    strength_max = int(s.get("strength_max") or 30)
+    strength_emoji = str(s.get("strength_emoji") or "🟢")
+
+    img_on = bool(s.get("buy_image_on", False))
+    img_set = bool((s.get("buy_image_file_id") or "").strip())
+    img = "ON ✅" if img_on else "OFF ❌"
+    img_note = "set" if img_set else "not set"
+
     text = (
         "*SpyTON BuyBot Settings*\n"
         f"• STON.fi: *{ston}*\n"
@@ -871,16 +996,32 @@ async def send_settings(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg, e
         f"• Burst mode: *{burst}*\n"
         f"• Anti-spam: *{anti}*\n"
         f"• Min buy (TON): *{min_buy}*\n"
+        f"• Buy strength: *{strength}* ({strength_emoji}, step {strength_step} TON, max {strength_max})\n"
+        f"• Buy image: *{img}* ({img_note})\n"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"STON.fi: {ston}", callback_data="TOG_STON"),
          InlineKeyboardButton(f"DeDust: {dedust}", callback_data="TOG_DEDUST")],
         [InlineKeyboardButton(f"Burst: {burst}", callback_data="TOG_BURST")],
+        [InlineKeyboardButton(f"Strength: {strength}", callback_data="TOG_STRENGTH"),
+         InlineKeyboardButton(f"Image: {img}", callback_data="TOG_IMAGE")],
+        [InlineKeyboardButton("🖼 Set Buy Image", callback_data="IMG_SET"),
+         InlineKeyboardButton("🗑 Clear Image", callback_data="IMG_CLEAR")],
         [InlineKeyboardButton("Min 0", callback_data="MIN_0"),
          InlineKeyboardButton("0.1", callback_data="MIN_0.1"),
          InlineKeyboardButton("0.5", callback_data="MIN_0.5"),
          InlineKeyboardButton("1", callback_data="MIN_1"),
          InlineKeyboardButton("5", callback_data="MIN_5")],
+        [InlineKeyboardButton("Step 1", callback_data="STEP_1"),
+         InlineKeyboardButton("5", callback_data="STEP_5"),
+         InlineKeyboardButton("10", callback_data="STEP_10"),
+         InlineKeyboardButton("20", callback_data="STEP_20")],
+        [InlineKeyboardButton("Max 10", callback_data="MAX_10"),
+         InlineKeyboardButton("15", callback_data="MAX_15"),
+         InlineKeyboardButton("30", callback_data="MAX_30")],
+        [InlineKeyboardButton("🟢", callback_data="EMO_GREEN"),
+         InlineKeyboardButton("✈️", callback_data="EMO_PLANE"),
+         InlineKeyboardButton("💎", callback_data="EMO_DIAMOND")],
         [InlineKeyboardButton("Anti: LOW", callback_data="SPAM_LOW"),
          InlineKeyboardButton("MED", callback_data="SPAM_MED"),
          InlineKeyboardButton("HIGH", callback_data="SPAM_HIGH")],
@@ -1025,6 +1166,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_chat_id = chat.id
 
     await configure_group_token(target_chat_id, addr, context, reply_to_chat=chat.id)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Capture a buy image from an admin and store its Telegram file_id."""
+    if not update.message or not update.effective_user or not update.effective_chat:
+        return
+    user = update.effective_user
+    chat = update.effective_chat
+    if user.id not in AWAITING_IMAGE:
+        return
+
+    target_chat_id = AWAITING_IMAGE.get(user.id)
+    if not target_chat_id:
+        return
+
+    # In groups, ensure they are sending the photo inside the same group they are configuring.
+    if chat.type in ("group", "supergroup") and chat.id != target_chat_id:
+        return
+
+    # In private, we trust the stored target_chat_id.
+    if not await is_admin(context.bot, target_chat_id, user.id):
+        AWAITING_IMAGE.pop(user.id, None)
+        return
+
+    photos = update.message.photo or []
+    if not photos:
+        return
+
+    file_id = photos[-1].file_id  # largest
+    g = get_group(target_chat_id)
+    g["settings"]["buy_image_file_id"] = file_id
+    g["settings"]["buy_image_on"] = True
+    save_groups()
+    AWAITING_IMAGE.pop(user.id, None)
+
+    await update.message.reply_text("✅ Buy image saved. Image mode is now ON.")
 
 async def configure_group_token(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_to_chat: int):
     g = get_group(chat_id)
@@ -1306,7 +1483,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     title = sym or name or "TOKEN"
 
     ton_amt = float(b.get("ton") or 0.0)
-    tok_amt = b.get("token_amt")
+    tok_amt = b.get("token_amount")
     tok_symbol = b.get("token_symbol") or sym or ""
 
     buyer_full = str(b.get("buyer") or "")
@@ -1354,7 +1531,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     holders = None
     try:
         info = tonapi_jetton_info(token.get("address") or "")
-        h = info.get("holders_count") if isinstance(info, dict) else None
+        h = info.get("holders_count")
         if h is not None:
             holders = int(h)
     except Exception:
@@ -1362,22 +1539,60 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
 
     # Links row
     pair_for_links = pool_for_market or ""
-    tx_url = f"https://tonviewer.com/transaction/{tx}" if tx else None
+    tx_hex = _normalize_tx_hash_to_hex(tx)
+    tx_url = f"https://tonviewer.com/transaction/{tx_hex}" if tx_hex else None
     gt_url = gecko_terminal_pool_url(pair_for_links) if pair_for_links else None
     dex_url = f"https://dexscreener.com/ton/{pair_for_links}" if pair_for_links else None
     tg_link = token.get("telegram") or DEFAULT_TOKEN_TG
     trending = TRENDING_URL
 
+    # Pull settings for this chat (for strength + image)
+    g = get_group(chat_id)
+    s = g.get("settings") or DEFAULT_SETTINGS
+
+    def fmt_usd(x: Optional[float], decimals: int = 0) -> Optional[str]:
+        if x is None:
+            return None
+        try:
+            if decimals <= 0:
+                return f"${float(x):,.0f}"
+            return f"${float(x):,.{decimals}f}"
+        except Exception:
+            return None
+
+    # Crypton-style buy strength bar
+    strength_block = ""
+    if bool(s.get("strength_on", True)):
+        try:
+            step = float(s.get("strength_step_ton") or 5.0)
+            max_n = int(s.get("strength_max") or 30)
+            emo = str(s.get("strength_emoji") or "🟢")
+            n = 1 if ton_amt > 0 else 0
+            if step > 0:
+                n = max(1, int(ton_amt // step))
+            n = min(max_n, n)
+            # wrap in lines of 15 emojis (like Crypton)
+            per_line = 15
+            rows = []
+            for i in range(0, n, per_line):
+                rows.append(emo * min(per_line, n - i))
+            strength_block = "\n".join(rows)
+        except Exception:
+            strength_block = ""
+
     lines: List[str] = []
-    lines.append(f"*{html.escape(title)} Buy!*")
+    # Header similar to Crypton
+    lines.append(f"*{html.escape(title)} Buy!* — {html.escape(source)}")
+    if strength_block:
+        lines.append(strength_block)
     lines.append("")
-    lines.append(f"💎 *{ton_amt:,.2f} TON*")
+    lines.append(f"Spent: *{ton_amt:,.2f} TON*")
     if tok_amt and tok_symbol:
         try:
             tok_amt_f = float(tok_amt)
-            lines.append(f"🪙 *{tok_amt_f:,.0f} {html.escape(str(tok_symbol))}*")
+            lines.append(f"Got: *{tok_amt_f:,.0f} {html.escape(str(tok_symbol))}*")
         except Exception:
-            lines.append(f"🪙 *{html.escape(str(tok_amt))} {html.escape(str(tok_symbol))}*")
+            lines.append(f"Got: *{html.escape(str(tok_amt))} {html.escape(str(tok_symbol))}*")
     lines.append("")
     # Buyer wallet clickable
     if buyer_url:
@@ -1385,13 +1600,13 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     else:
         lines.append(f"{buyer_short}")
 
-    # Stats
+    # Stats (Crypton-style)
     if price_usd is not None:
-        lines.append(f"Price: ${price_usd:,.6f}")
+        lines.append(f"Price: {fmt_usd(price_usd, 6)}")
     if liq_usd is not None:
-        lines.append(f"Liquidity: ${liq_usd:,.0f}")
+        lines.append(f"Liquidity: {fmt_usd(liq_usd, 0)}")
     if mc_usd is not None:
-        lines.append(f"MCap: ${mc_usd:,.0f}")
+        lines.append(f"MCap: {fmt_usd(mc_usd, 0)}")
     if holders is not None:
         lines.append(f"Holders: {holders}")
 
@@ -1419,14 +1634,27 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     buy_url = f"{ref}_{ca}" if ca else ref
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Buy {sym or 'Token'} with dTrade", url=buy_url)]])
 
+    # If buy image enabled and a Telegram file_id is set, send a photo with caption (not a link).
+    buy_file_id = (s.get("buy_image_file_id") or "").strip()
+    use_image = bool(s.get("buy_image_on", False)) and bool(buy_file_id)
+
     try:
-        await app.bot.send_message(
-            chat_id=chat_id,
-            text=msg,
-            parse_mode="Markdown",
-            reply_markup=kb,
-            disable_web_page_preview=True,
-        )
+        if use_image:
+            await app.bot.send_photo(
+                chat_id=chat_id,
+                photo=buy_file_id,
+                caption=msg,
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
+        else:
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=msg,
+                parse_mode="Markdown",
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
     except Exception as e:
         # fallback without keyboard/markdown
         try:
@@ -1493,6 +1721,7 @@ def main():
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CallbackQueryHandler(on_replace_button, pattern=r"^(REPL_|CANCEL_REPL$)"))
     application.add_handler(CallbackQueryHandler(on_button))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 

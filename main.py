@@ -4,32 +4,6 @@ from typing import Any, Dict, Optional, List, Tuple
 from urllib.parse import urlparse
 import requests
 
-
-# --- TON price (USD) cache ---
-_TON_PRICE_CACHE = {"ts": 0.0, "price": None}
-
-def get_ton_price_usd() -> Optional[float]:
-    """Fetch TON price in USD. Cached for 60s to avoid rate limits.
-    Uses CoinGecko simple price endpoint.
-    """
-    try:
-        now = time.time()
-        if _TON_PRICE_CACHE["price"] is not None and (now - _TON_PRICE_CACHE["ts"]) < 60:
-            return float(_TON_PRICE_CACHE["price"])
-        # CoinGecko id for TON is commonly 'the-open-network'
-        url = "https://api.coingecko.com/api/v3/simple/price"
-        r = requests.get(url, params={"ids": "the-open-network", "vs_currencies": "usd"}, timeout=10)
-        if r.status_code == 200:
-            j = r.json()
-            p = (j.get("the-open-network") or {}).get("usd")
-            if p:
-                _TON_PRICE_CACHE["ts"] = now
-                _TON_PRICE_CACHE["price"] = float(p)
-                return float(p)
-    except Exception:
-        pass
-    return None
-
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -247,10 +221,6 @@ SEEN: Dict[str, Any] = _load_json(SEEN_FILE, {})    # chat_id -> {dedupe_key: ts
 
 # user_id -> chat_id awaiting token paste
 AWAITING: Dict[int, int] = {}
-# user_id -> chat_id awaiting media upload (photo/gif)
-AWAITING_MEDIA: Dict[int, int] = {}
-PENDING_REPLY: Dict[int, int] = {}  # chat_id -> message_id to reply to for token input (privacy-mode safe)
-PENDING_USER: Dict[int, int] = {}   # chat_id -> user_id who initiated configure
 
 # -------------------- HELPERS --------------------
 JETTON_RE = re.compile(r"\b([EU]Q[A-Za-z0-9_-]{40,80})\b")
@@ -743,14 +713,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Admins only.", show_alert=True)
             return
         AWAITING[user.id] = chat.id
-        # Privacy-mode safe: ask user to *reply* with the token address/link
-        from telegram import ForceReply
-        msg = await q.message.reply_text(
-            "Reply to this message with the token address (EQ…/UQ…) or a supported link (GT/DexS/STON/DeDust).",
-            reply_markup=ForceReply(selective=True)
-        )
-        PENDING_REPLY[chat.id] = msg.message_id
-        PENDING_USER[chat.id] = user.id
+        await q.message.reply_text("Paste the token address (EQ… / UQ…) or a supported link.")
         return
 
     if data == "SET_GROUP":
@@ -796,39 +759,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s = g["settings"]
         s["anti_spam"] = data.split("_",1)[1]
         save_groups()
-        await send_settings(chat.id, context, q.message, edit=True)
-        return
-
-
-    if data.startswith("STR_"):
-        if not await is_admin(context.bot, chat.id, user.id):
-            await q.answer("Admins only.", show_alert=True)
-            return
-        g = get_group(chat.id)
-        s = g["settings"]
-        s["strength"] = data.split("_",1)[1]
-        save_groups()
-        await send_settings(chat.id, context, q.message, edit=True)
-        return
-
-    if data == "MEDIA_SET":
-        if not await is_admin(context.bot, chat.id, user.id):
-            await q.answer("Admins only.", show_alert=True)
-            return
-        AWAITING_MEDIA[user.id] = chat.id
-        await q.message.reply_text("Send the *photo* or *GIF* you want to show on every buy in this group.", parse_mode="Markdown")
-        return
-
-    if data == "MEDIA_CLEAR":
-        if not await is_admin(context.bot, chat.id, user.id):
-            await q.answer("Admins only.", show_alert=True)
-            return
-        g = get_group(chat.id)
-        s = g["settings"]
-        s.pop("media_file_id", None)
-        s.pop("media_type", None)
-        save_groups()
-        await q.message.reply_text("✅ Buy image cleared for this group.")
         await send_settings(chat.id, context, q.message, edit=True)
         return
 
@@ -881,8 +811,6 @@ async def send_settings(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg, e
         f"• Burst mode: *{burst}*\n"
         f"• Anti-spam: *{anti}*\n"
         f"• Min buy (TON): *{min_buy}*\n"
-        f"• Buy strength: *{(s.get('strength') or 'MED').upper()}*\n"
-        f"• Media: *{'SET ✅' if s.get('media_file_id') else 'NONE'}*\n"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"STON.fi: {ston}", callback_data="TOG_STON"),
@@ -896,8 +824,6 @@ async def send_settings(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg, e
         [InlineKeyboardButton("Anti: LOW", callback_data="SPAM_LOW"),
          InlineKeyboardButton("MED", callback_data="SPAM_MED"),
          InlineKeyboardButton("HIGH", callback_data="SPAM_HIGH")],
-        [InlineKeyboardButton("Strength: LOW", callback_data="STR_LOW"), InlineKeyboardButton("MED", callback_data="STR_MED"), InlineKeyboardButton("HIGH", callback_data="STR_HIGH")],
-        [InlineKeyboardButton("🖼 Set Buy Image", callback_data="MEDIA_SET"), InlineKeyboardButton("🧹 Clear Image", callback_data="MEDIA_CLEAR")],
     ])
     if edit:
         try:
@@ -960,8 +886,6 @@ def resolve_jetton_from_text_sync(text: str) -> Optional[str]:
         return None
 
     # 1) Direct jetton address
-    # Users often paste addresses wrapped inside other text (ref links, underscores, etc.).
-    # Try the whole string first, then try extracting address-like substrings.
     direct = detect_token_address(t)
     if direct:
         # If it *looks* like a pool link context, try pair lookup first
@@ -979,21 +903,6 @@ def resolve_jetton_from_text_sync(text: str) -> Optional[str]:
                 if quote_sym == "TON" and base_addr:
                     return base_addr
         return direct
-
-    # Try to extract any EQ/UQ-like substrings (base64url) and re-run detection.
-    # This fixes cases like: EQB420y..._j1f_tPu1J488I__PX
-    candidates = []
-    for m in re.findall(r"[EU]Q[A-Za-z0-9_-]{40,70}", t):
-        candidates.append(m)
-    # Also include regex matches used elsewhere
-    m2 = JETTON_RE.findall(t)
-    if m2:
-        candidates.extend(m2)
-    for cand in candidates:
-        cand = cand.strip()
-        d = detect_token_address(cand)
-        if d:
-            return d
 
     # 2) GeckoTerminal / Dexscreener / ston.fi / dedust.io pool links
     pair_id = None
@@ -1036,61 +945,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = (update.message.text or "").strip()
 
-    # If admin is setting media for this group
-    awaiting_chat = AWAITING_MEDIA.get(user.id)
-    if awaiting_chat and chat.id == awaiting_chat:
-        # Accept photo or GIF (animation)
-        media_file_id = None
-        media_type = None
-        if update.message.photo:
-            media_file_id = update.message.photo[-1].file_id
-            media_type = "photo"
-        elif update.message.animation:
-            media_file_id = update.message.animation.file_id
-            media_type = "animation"
-        elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
-            media_file_id = update.message.document.file_id
-            media_type = "photo"
-        if media_file_id:
-            g = get_group(chat.id)
-            s = g["settings"]
-            s["media_file_id"] = media_file_id
-            s["media_type"] = media_type
-            save_groups()
-            AWAITING_MEDIA.pop(user.id, None)
-            await update.message.reply_text("✅ Buy image saved for this group.")
-            await send_settings(chat.id, context, update.message)
-            return
-        # If they sent something else, ignore and keep waiting
-        return
-
     # Resolve either a jetton address or a supported link (GT / DexScreener / STON / DeDust)
-    # optional token Telegram link in same message
-    tg_in = None
-    m = re.search(r'(https?://t\.me/[^\s]+|t\.me/[^\s]+)', text)
-    if m:
-        tg_in = m.group(1)
-        if tg_in.startswith('t.me/'):
-            tg_in = 'https://' + tg_in
     addr = await _to_thread(resolve_jetton_from_text_sync, text)
     if not addr:
-        # Only reply with an error if the user is *currently* configuring.
-        if chat.type == "private" and AWAITING.get(user.id):
-            await update.message.reply_text(
-                "❌ I couldn't detect a TON token address from that message.\n\n"
-                "Send a *Jetton master address* (starts with EQ… / UQ…) or a supported link:\n"
-                "• GeckoTerminal pool link\n• STON.fi pool link\n• DeDust pool link\n• DexScreener link",
-                parse_mode="Markdown"
-            )
-        elif chat.type != "private":
-            pending_mid = PENDING_REPLY.get(chat.id)
-            if pending_mid and update.message.reply_to_message and update.message.reply_to_message.message_id == pending_mid:
-                await update.message.reply_text(
-                    "❌ I couldn't detect the token from that.\n\n"
-                    "Tip: paste the *Jetton master address* (EQ…/UQ…) or a GeckoTerminal/STON.fi/DeDust link.",
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True
-                )
         return
 
     # decide which chat to configure
@@ -1102,26 +959,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     else:
         # in group: only admins can configure
-        # In group: only admins can configure.
-        # If the bot privacy mode is ON, it will only receive messages that are replies.
-        pending_mid = PENDING_REPLY.get(chat.id)
-        pending_uid = PENDING_USER.get(chat.id)
-        if pending_mid:
-            # require reply to the bot prompt, and (optionally) same user who initiated it
-            if not update.message.reply_to_message or update.message.reply_to_message.message_id != pending_mid:
-                return
-            if pending_uid and user.id != pending_uid:
-                return
         if not await is_admin(context.bot, chat.id, user.id):
             return
         # If user pressed configure, it's this chat anyway
         target_chat_id = chat.id
 
-    await configure_group_token(target_chat_id, addr, context, reply_to_chat=chat.id, token_tg=tg_in)
-    PENDING_REPLY.pop(target_chat_id, None)
-    PENDING_USER.pop(target_chat_id, None)
+    await configure_group_token(target_chat_id, addr, context, reply_to_chat=chat.id)
 
-async def configure_group_token(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_to_chat: int, token_tg: Optional[str] = None):
+async def configure_group_token(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_to_chat: int):
     g = get_group(chat_id)
     # 1 token per group: confirm replace if exists and different
     existing = g.get("token") or None
@@ -1197,7 +1042,6 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "address": jetton,
         "name": name,
         "symbol": sym,
-        "telegram": token_tg or "",
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
         "set_at": int(time.time()),
@@ -1388,11 +1232,12 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     title = sym or name or "TOKEN"
 
     ton_amt = float(b.get("ton") or 0.0)
-    tok_amt = b.get("token_amt") if b.get("token_amt") is not None else b.get("token_amount")
-    tok_symbol = b.get("token_symbol") or token.get("symbol") or sym or ""
+    tok_amt = b.get("token_amt")
+    tok_symbol = b.get("token_symbol") or sym or ""
 
     buyer_full = str(b.get("buyer") or "")
     buyer_short = _short_addr(buyer_full)
+    buyer_url = f"https://tonviewer.com/address/{buyer_full}" if buyer_full else None
     tx = str(b.get("tx") or "")
 
     ston_pool = token.get("ston_pool") or ""
@@ -1446,98 +1291,53 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     tx_url = f"https://tonviewer.com/transaction/{tx}" if tx else None
     gt_url = gecko_terminal_pool_url(pair_for_links) if pair_for_links else None
     dex_url = f"https://dexscreener.com/ton/{pair_for_links}" if pair_for_links else None
-    tg_link = token.get("telegram") or ""
+    tg_link = token.get("telegram") or DEFAULT_TOKEN_TG
     trending = TRENDING_URL
 
-
-    # ----- Premium message style (HTML) -----
-    # Buy strength diamonds (per-group setting)
-    gcfg = get_group(chat_id)
-    s = (gcfg.get("settings") or {})
-    strength = (s.get("strength") or "MED").upper()
-    if strength == "LOW":
-        thr = [0.2, 0.5, 1, 2, 5]
-    elif strength == "HIGH":
-        thr = [1, 2, 5, 10, 20]
-    else:
-        thr = [0.5, 1, 2, 5, 10]
-    diamonds = "💎" * sum(1 for t in thr if ton_amt >= t)
-
-    # Buyer clickable
-    buyer_line = ""
-    if buyer_full:
-        buyer_line = f'<a href="https://tonviewer.com/address/{html.escape(buyer_full)}">{html.escape(buyer_short)}</a>'
-
-    # Token amounts (dynamic decimals, never swap with TON)
-    tok_line = ""
+    lines: List[str] = []
+    lines.append(f"*{html.escape(title)} Buy!*")
+    lines.append("")
+    lines.append(f"💎 *{ton_amt:,.2f} TON*")
     if tok_amt and tok_symbol:
-        def _fmt_amount(v: float) -> str:
-            av = abs(v)
-            if av >= 1_000_000:
-                d = 0
-            elif av >= 1_000:
-                d = 2
-            elif av >= 1:
-                d = 2
-            elif av >= 0.01:
-                d = 4
-            else:
-                d = 6
-            s = f"{v:,.{d}f}"
-            # trim trailing zeros
-            if "." in s:
-                s = s.rstrip("0").rstrip(".")
-            return s
-
         try:
-            _ta = float(tok_amt)
-            tok_line = f"🪙 <b>{_fmt_amount(_ta)} {html.escape(str(tok_symbol))}</b>"
+            tok_amt_f = float(tok_amt)
+            lines.append(f"🪙 *{tok_amt_f:,.0f} {html.escape(str(tok_symbol))}*")
         except Exception:
-            tok_line = f"🪙 <b>{html.escape(str(tok_amt))} {html.escape(str(tok_symbol))}</b>"
-
-    # Build links row (keep only TX | GT | DexS | Telegram | Trending)
-    link_parts: List[str] = []
-    if tx_url:
-        link_parts.append(f'<a href="{html.escape(tx_url)}">TX</a>')
-    if gt_url:
-        link_parts.append(f'<a href="{html.escape(gt_url)}">GT</a>')
-    if dex_url:
-        link_parts.append(f'<a href="{html.escape(dex_url)}">DexS</a>')
-    if tg_link:
-        link_parts.append(f'<a href="{html.escape(tg_link)}">Telegram</a>')
-    if trending:
-        link_parts.append(f'<a href="{html.escape(trending)}">Trending</a>')
-    links_row = " | ".join(link_parts)
-
-    parts: List[str] = []
-    parts.append(f"<b>{html.escape(title)} Buy!</b>")
-    if diamonds:
-        parts.append(diamonds)
-    ton_price = get_ton_price_usd()
-    if ton_price:
-        parts.append(f"💎 <b>{ton_amt:,.2f} TON</b> (${ton_amt*ton_price:,.2f})")
+            lines.append(f"🪙 *{html.escape(str(tok_amt))} {html.escape(str(tok_symbol))}*")
+    lines.append("")
+    # Buyer wallet clickable
+    if buyer_url:
+        lines.append(f"[{buyer_short}]({buyer_url})")
     else:
-        parts.append(f"💎 <b>{ton_amt:,.2f} TON</b>")
-    if tok_line:
-        parts.append(tok_line)
-    if buyer_line:
-        parts.append(buyer_line)
+        lines.append(f"{buyer_short}")
 
     # Stats
     if price_usd is not None:
-        parts.append(f"Price: ${price_usd:,.6f}")
+        lines.append(f"Price: ${price_usd:,.6f}")
     if liq_usd is not None:
-        parts.append(f"Liquidity: ${liq_usd:,.0f}")
+        lines.append(f"Liquidity: ${liq_usd:,.0f}")
     if mc_usd is not None:
-        parts.append(f"MCap: ${mc_usd:,.0f}")
+        lines.append(f"MCap: ${mc_usd:,.0f}")
     if holders is not None:
-        parts.append(f"Holders: {holders}")
+        lines.append(f"Holders: {holders}")
 
-    if links_row:
-        parts.append(links_row)
+    lines.append("")
+    # Keep only TX | GT | DexS | Telegram | Trending
+    link_parts: List[str] = []
+    if tx_url:
+        link_parts.append(f"[TX]({tx_url})")
+    if gt_url:
+        link_parts.append(f"[GT]({gt_url})")
+    if dex_url:
+        link_parts.append(f"[DexS]({dex_url})")
+    if tg_link:
+        link_parts.append(f"[Telegram]({tg_link})")
+    if trending:
+        link_parts.append(f"[Trending]({trending})")
+    if link_parts:
+        lines.append(" | ".join(link_parts))
 
-    msg = "\n".join(parts)
-
+    msg = "\n".join(lines)
 
     # Single buy button (dTrade referral + CA)
     ref = (DTRADE_REF or "https://t.me/dtrade?start=11TYq7LInG").rstrip("_")
@@ -1546,22 +1346,17 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Buy {sym or 'Token'} with dTrade", url=buy_url)]])
 
     try:
-        # Optional per-group media (photo/GIF) attached to every buy
-        gcfg = get_group(chat_id)
-        s = (gcfg.get("settings") or {})
-        media_id = s.get("media_file_id")
-        media_type = s.get("media_type")
-        if media_id:
-            if media_type == "animation":
-                await app.bot.send_animation(chat_id=chat_id, animation=media_id, caption=msg, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
-            else:
-                await app.bot.send_photo(chat_id=chat_id, photo=media_id, caption=msg, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
-        else:
-            await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=msg,
+            parse_mode="Markdown",
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
     except Exception as e:
         # fallback without keyboard/markdown
         try:
-            await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML", disable_web_page_preview=True)
+            await app.bot.send_message(chat_id=chat_id, text=msg.replace("*", ""), disable_web_page_preview=True)
         except Exception:
             log.debug("send fail %s", e)
 

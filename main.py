@@ -346,14 +346,27 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
         # DeDust (warmup by latest trade ids and tx hashes where available)
         if dedust_pool:
             trades = await dedust_latest_trades(dedust_pool, limit=60)
+
+            # Some DeDust endpoints may return trades in oldest->newest order.
+            # To prevent "old buys" spam, we always baseline to the MAX lt/trade_id we can see.
+            max_lt_i = None
             for t in trades:
-                # baseline LT (best) so we can skip history even if API has no timestamp
-                lt = str(t.get('lt') or '').strip()
-                if lt and newest_dedust is None:
-                    newest_dedust = lt
+                lt_raw = (t.get('lt') or t.get('trade_id') or t.get('id') or '')
+                lt_s = str(lt_raw).strip()
+                if lt_s:
+                    try:
+                        lt_i = int(lt_s)
+                        if (max_lt_i is None) or (lt_i > max_lt_i):
+                            max_lt_i = lt_i
+                    except Exception:
+                        pass
+
                 txhash = (t.get('tx_hash') or t.get('txHash') or t.get('hash') or '').strip()
                 if txhash:
                     bucket[f"dedust:{dedust_pool}:{txhash}"] = int(time.time())
+
+            if max_lt_i is not None:
+                newest_dedust = str(max_lt_i)
 
         # save baselines into group token so polling skips older history
         g = GROUPS.get(str(chat_id)) or {}

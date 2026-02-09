@@ -951,7 +951,9 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add BuyBot to Group", url=add_url)],
             [InlineKeyboardButton("⚙️ Configure Token", callback_data="CFG_PRIVATE")],
-            [InlineKeyboardButton("🛠 Settings", callback_data="SET_PRIVATE")],
+            # Keep callback_data as SET_PRIVATE to avoid breaking older buttons,
+            # but present it to users as "Token Settings".
+            [InlineKeyboardButton("⚙️ Token Settings", callback_data="SET_PRIVATE")],
             [InlineKeyboardButton("🆘 Support", url="https://t.me/SpyTonEco")],
         ])
         await update.message.reply_text(
@@ -964,7 +966,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # In group, show group menu
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("⚙️ Configure Token", callback_data="CFG_GROUP")],
-            [InlineKeyboardButton("🛠 Settings", callback_data="SET_GROUP")],
+            # Keep callback_data as SET_GROUP, but label as "Token Settings".
+            [InlineKeyboardButton("⚙️ Token Settings", callback_data="SET_GROUP")],
             [InlineKeyboardButton("📊 Status", callback_data="STATUS_GROUP")],
             [InlineKeyboardButton("🗑 Remove Token", callback_data="REMOVE_GROUP")],
         ])
@@ -1174,7 +1177,7 @@ async def send_settings(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg, e
     img_note = "set" if img_set else "not set"
 
     text = (
-        "*SpyTON BuyBot Settings*\n"
+        "*Token Settings*\n"
         f"• STON.fi: *{ston}*\n"
         f"• DeDust: *{dedust}*\n"
         f"• Burst mode: *{burst}*\n"
@@ -1499,7 +1502,7 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         f"• STON.fi pool: `{ston_pool or 'NONE'}`\n"
         f"• DeDust pool: `{dedust_pool or 'NONE'}`\n\n"
         f"Now posting buys automatically for this group.\n"
-        f"Use *Settings* to set buy strength & image."
+        f"Use *Token Settings* to set buy strength & image."
     )
 
     await context.bot.send_message(
@@ -1997,7 +2000,7 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if new and new.status in ("member","administrator"):
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("⚙️ Configure Token", callback_data="CFG_GROUP")],
-                [InlineKeyboardButton("🛠 Settings", callback_data="SET_GROUP")],
+                [InlineKeyboardButton("⚙️ Token Settings", callback_data="SET_GROUP")],
                 [InlineKeyboardButton("📊 Status", callback_data="STATUS_GROUP")],
             ])
             await context.bot.send_message(

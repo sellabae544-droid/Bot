@@ -2465,8 +2465,6 @@ def main():
     log.info("SpyTON Public BuyBot starting...")
     application.run_polling(close_loop=False)
 
-if __name__ == "__main__":
-    main()
 # -------------------- STON API (exported events) --------------------
 STON_BASE = os.getenv("STON_BASE", "https://api.ston.fi").rstrip("/")
 STON_LATEST_BLOCK_URL = f"{STON_BASE}/export/dexscreener/v1/latest-block"
@@ -2536,4 +2534,5 @@ def ensure_ton_leg_for_pool(token: Dict[str, Any]) -> Optional[int]:
         return 1
     return None
 
-
+if __name__ == '__main__':
+    main()

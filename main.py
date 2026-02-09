@@ -12,6 +12,7 @@ from telegram.ext import (
     MessageHandler, ChatMemberHandler, ContextTypes, filters
 )
 
+from datetime import datetime, timezone
 # -------------------- LOGGING --------------------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -192,6 +193,8 @@ def dedust_trade_to_buy(tr: Dict[str, Any], token_addr: str) -> Optional[Dict[st
         "ton": ton_amt,
         "token_amount": token_amt,
         "trade_id": trade_id,
+        "timestamp": ts,
+        "lt": lt,
     }
 
 # -------------------- STATE --------------------
@@ -941,15 +944,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     group_id = None
                 if group_id:
-                    # Crypton-style: choose DEX first, then send CA.
-                    AWAITING[update.effective_user.id] = {"group_id": group_id, "stage": "DEX", "dex": ""}
-                    kb = InlineKeyboardMarkup([
-                        [InlineKeyboardButton("StonFi", callback_data=f"DEX_STON_{group_id}"),
-                         InlineKeyboardButton("DeDust", callback_data=f"DEX_DEDUST_{group_id}")],
-                    ])
+                    # Auto-detect best DEX (STON.fi / DeDust) then start tracking.
+                    AWAITING[update.effective_user.id] = {"group_id": group_id, "stage": "CA", "dex": "auto"}
                     await update.message.reply_text(
-                        "✅ SpyTON BuyBot connected\\n\\nChoose where your pair exists (like Crypton):",
-                        reply_markup=kb
+                        "✅ SpyTON BuyBot connected\n\nSend your token CA here. I will auto-detect the best DEX (STON.fi / DeDust) and start tracking.",
                     )
                     return
         add_url = await build_add_to_group_url(context.application)
@@ -1819,8 +1817,36 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         name = (dx.get("name") or "").strip()
         sym = (dx.get("symbol") or "").strip()
     dex_mode = (dex_mode or "both").lower().strip()
-    ston_pool = find_stonfi_ton_pair_for_token(jetton) if dex_mode in ("both","ston","stonfi") else None
-    dedust_pool = find_dedust_ton_pair_for_token(jetton) if dex_mode in ("both","dedust") else None
+    ston_pool = find_stonfi_ton_pair_for_token(jetton) if dex_mode in ("both","auto","best","ston","stonfi") else None
+    dedust_pool = find_dedust_ton_pair_for_token(jetton) if dex_mode in ("both","auto","best","dedust") else None
+
+    best_dex = None
+    # Auto mode: resolve both pools (if possible) and pick the best one to track by default
+    if dex_mode in ("auto","best"):
+        ston_score = 0.0
+        dedust_score = 0.0
+        if ston_pool:
+            p = _dex_pair_lookup(ston_pool) or {}
+            ston_score = float((p.get("liquidity") or {}).get("usd") or 0) + float((p.get("volume") or {}).get("h24") or 0) * 0.1
+        if dedust_pool:
+            p = _dex_pair_lookup(dedust_pool) or {}
+            dedust_score = float((p.get("liquidity") or {}).get("usd") or 0) + float((p.get("volume") or {}).get("h24") or 0) * 0.1
+        if ston_score <= 0 and ston_pool and not dedust_pool:
+            best_dex = "stonfi"
+        elif dedust_score <= 0 and dedust_pool and not ston_pool:
+            best_dex = "dedust"
+        else:
+            if ston_score >= dedust_score and ston_pool:
+                best_dex = "stonfi"
+            elif dedust_pool:
+                best_dex = "dedust"
+        # enable only the selected dex by default (user can still enable both later if desired)
+        settings["enable_stonfi"] = bool(ston_pool) and best_dex == "stonfi"
+        settings["enable_dedust"] = bool(dedust_pool) and best_dex == "dedust"
+        settings["dex_mode"] = "auto_best"
+    else:
+        settings["enable_stonfi"] = bool(ston_pool) and dex_mode in ("both","ston","stonfi")
+        settings["enable_dedust"] = bool(dedust_pool) and dex_mode in ("both","dedust")
 
     g = get_group(chat_id)
     # Auto-enable only the selected DEX (Crypton-style). You can enable the other DEX later in Token Settings.
@@ -2470,5 +2496,3 @@ def ensure_ton_leg_for_pool(token: Dict[str, Any]) -> Optional[int]:
         token["ton_leg"] = 1
         return 1
     return None
-
-

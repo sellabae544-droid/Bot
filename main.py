@@ -202,7 +202,7 @@ def dedust_trade_to_buy(tr: Dict[str, Any], token_addr: str) -> Optional[Dict[st
 DEFAULT_SETTINGS = {
     "enable_ston": True,
     "enable_dedust": True,
-    "min_buy_ton": 0.0,
+    "min_buy": 0.0,
     "anti_spam": "MED",   # LOW | MED | HIGH
     "burst_mode": True,
 
@@ -350,11 +350,20 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
         # DeDust (warmup by latest trade ids and tx hashes where available)
         if dedust_pool:
             trades = await dedust_latest_trades(dedust_pool, limit=60)
+            # Some endpoints return oldest->newest; take MAX lt as baseline to avoid replaying history.
+            max_lt = None
             for t in trades:
-                # baseline LT (best) so we can skip history even if API has no timestamp
                 lt = str(t.get('lt') or '').strip()
-                if lt and newest_dedust is None:
-                    newest_dedust = lt
+                if not lt:
+                    continue
+                try:
+                    lt_int = int(lt)
+                except Exception:
+                    continue
+                if (max_lt is None) or (lt_int > max_lt):
+                    max_lt = lt_int
+            if max_lt is not None:
+                newest_dedust = str(max_lt)
                 txhash = (t.get('tx_hash') or t.get('txHash') or t.get('hash') or '').strip()
                 if txhash:
                     bucket[f"dedust:{dedust_pool}:{txhash}"] = int(time.time())
@@ -539,12 +548,12 @@ def ton_usd_price() -> Optional[float]:
         pass
     return None
 
-def min_buy_ton_threshold(settings: Dict[str, Any]) -> float:
+def min_buy_threshold(settings: Dict[str, Any]) -> float:
     """Return the TON amount threshold implied by settings (TON or USD)."""
     unit = str(settings.get("min_buy_unit") or "TON").upper()
     if unit != "USD":
         try:
-            return float(settings.get("min_buy_ton") or 0.0)
+            return float(settings.get("min_buy") or 0.0)
         except Exception:
             return 0.0
     try:
@@ -1213,7 +1222,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         g = get_group(chat.id)
         s = g["settings"]
         val = float(data.split("_",1)[1])
-        s["min_buy_ton"] = val
+        s["min_buy"] = val
         save_groups()
         await send_settings(chat.id, context, q.message, edit=True)
         return
@@ -1309,7 +1318,7 @@ async def send_settings(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg, e
     dedust = "ON ✅" if s.get("enable_dedust", True) else "OFF ❌"
     burst = "ON ✅" if s.get("burst_mode", True) else "OFF ❌"
     anti = (s.get("anti_spam") or "MED").upper()
-    min_buy = s.get("min_buy_ton", 0.0)
+    min_buy = s.get("min_buy", 0.0)
 
     strength = "ON ✅" if s.get("strength_on", True) else "OFF ❌"
     strength_step = float(s.get("strength_step_ton") or 5.0)
@@ -1379,7 +1388,7 @@ async def send_token_settings(chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
     paused = bool(tok.get("paused", False)) if isinstance(tok, dict) else False
 
     unit = str(s.get("min_buy_unit") or "TON").upper()
-    min_buy_disp = f"{float(s.get('min_buy_ton') or 0.0)} TON" if unit != "USD" else f"${float(s.get('min_buy_usd') or 0.0)}"
+    min_buy_disp = f"{float(s.get('min_buy') or 0.0)} TON" if unit != "USD" else f"${float(s.get('min_buy_usd') or 0.0)}"
 
     text = (
         "*Token Settings*\n"
@@ -1452,7 +1461,7 @@ async def handle_token_settings_button(chat_id: int, data: str, update: Update, 
         if str(s.get("min_buy_unit") or "TON").upper() == "USD":
             s["min_buy_usd"] = val
         else:
-            s["min_buy_ton"] = val
+            s["min_buy"] = val
         save_groups()
         await send_token_settings(chat_id, context, msg, edit=True)
         return
@@ -2038,7 +2047,7 @@ async def poll_once(app: Application):
             save_groups()
             continue
 
-        min_buy = float(min_buy_ton_threshold(settings))
+        min_buy = float(min_buy_threshold(settings))
         anti = (settings.get("anti_spam") or "MED").upper()
         max_msgs, window = anti_spam_limit(anti)
 
@@ -2048,101 +2057,114 @@ async def poll_once(app: Application):
             burst["window_start"] = now
             burst["count"] = 0
 
-                    # STON (TonAPI events: reliable, catches UTYA STON.fi buys)
-            if settings.get("enable_ston", True) and token.get("ston_pool"):
-                pool = token["ston_pool"]
-                last_ts = int(token.get("last_ston_ts") or token.get("ignore_before_ts") or 0)
-                if last_ts <= 0:
-                    token["last_ston_ts"] = int(time.time())
-                    save_groups()
-                    continue
-            
+                # STON (TonAPI events: reliable, catches UTYA STON.fi buys)
+        if settings.get("enable_ston", True) and token.get("ston_pool"):
+            pool = token["ston_pool"]
+            last_ts = int(token.get("last_ston_ts") or token.get("ignore_before_ts") or 0)
+            if last_ts <= 0:
+                token["last_ston_ts"] = int(time.time())
+                save_groups()
+                continue
+        
+            evs = []
+            try:
+                evs = tonapi_account_events(pool, limit=25)
+            except Exception:
                 evs = []
-                try:
-                    evs = tonapi_account_events(pool, limit=25)
-                except Exception:
-                    evs = []
-            
-                newest_ts = last_ts
-                for ev in reversed(evs[:25]):
-                    ts = int(ev.get("timestamp") or ev.get("time") or 0)
-                    if ts <= last_ts:
-                        continue
-            
-                    buys = stonfi_extract_buys_from_tonapi_event(ev, token.get("address") or "")
-                    for bx in buys:
-                        ton_amt = float(bx.get("ton_in") or 0.0)
-                        tok_amt = float(bx.get("token_out") or 0.0)
-                        if ton_amt < min_buy_ton:
-                            continue
-                        b = {
-                            "ton": ton_amt,
-                            "token_amount": tok_amt,
-                            "buyer": bx.get("buyer") or "",
-                            "tx": bx.get("tx") or "",
-                            "token_symbol": token.get("symbol") or "",
-                        }
-                        await post_buy(app, chat_id, token, b, "STON.fi")
-                        await update_leaderboard(chat_id, token, str(b.get("buyer") or ""), ton_amt, settings)
-            
-                    newest_ts = max(newest_ts, ts)
-            
-                if newest_ts > last_ts:
-                    token["last_ston_ts"] = newest_ts
-                    save_groups()
-
-            # DeDust (trades API; warmup + strict lt compare to stop old spam)
-            if settings.get("enable_dedust", True) and token.get("dedust_pool"):
-                pool = token["dedust_pool"]
-            
-                # Warmup: set baseline lt and skip posting historical trades
-                if not token.get("last_dedust_trade"):
-                    try:
-                        warm = dedust_get_trades(pool, limit=1)
-                        if warm:
-                            token["last_dedust_trade"] = str(warm[0].get("lt") or warm[0].get("trade_id") or "")
-                    except Exception:
-                        pass
-                    token["last_dedust_ts"] = int(time.time())
-                    save_groups()
+        
+            newest_ts = last_ts
+            for ev in reversed(evs[:25]):
+                ts = int(ev.get("timestamp") or ev.get("time") or 0)
+                if ts <= last_ts:
                     continue
-            
-                last_lt = str(token.get("last_dedust_trade") or "")
-                last_lt_int = _as_int(last_lt, 0)
-            
-                trades = []
-                try:
-                    trades = dedust_get_trades(pool, limit=25)
-                except Exception:
-                    trades = []
-            
-                newest_lt_int = last_lt_int
-                newest_lt = last_lt
-            
-                for tr in reversed(trades[:25]):
-                    lt = str(tr.get("lt") or tr.get("trade_id") or "")
-                    lt_int = _as_int(lt, 0)
-                    if lt_int and lt_int <= last_lt_int:
+        
+                buys = stonfi_extract_buys_from_tonapi_event(ev, token.get("address") or "")
+                for bx in buys:
+                    ton_amt = float(bx.get("ton_in") or 0.0)
+                    tok_amt = float(bx.get("token_out") or 0.0)
+                    if ton_amt < min_buy:
                         continue
-            
-                    b = dedust_trade_to_buy(tr)
-                    ton_amt = float(b.get("ton") or 0.0)
-                    if ton_amt < min_buy_ton:
-                        newest_lt_int = max(newest_lt_int, lt_int)
-                        newest_lt = lt if lt else newest_lt
-                        continue
-            
-                    await post_buy(app, chat_id, token, b, "DeDust")
+                    b = {
+                        "ton": ton_amt,
+                        "token_amount": tok_amt,
+                        "buyer": bx.get("buyer") or "",
+                        "tx": bx.get("tx") or "",
+                        "token_symbol": token.get("symbol") or "",
+                    }
+                    await post_buy(app, chat_id, token, b, "STON.fi")
                     await update_leaderboard(chat_id, token, str(b.get("buyer") or ""), ton_amt, settings)
-            
+        
+                newest_ts = max(newest_ts, ts)
+        
+            if newest_ts > last_ts:
+                token["last_ston_ts"] = newest_ts
+                save_groups()
+
+        # DeDust (trades API; warmup + strict lt compare to stop old spam)
+        if settings.get("enable_dedust", True) and token.get("dedust_pool"):
+            pool = token["dedust_pool"]
+        
+            # Warmup: set baseline lt and skip posting historical trades
+            if not token.get("last_dedust_trade"):
+                try:
+                    warm = dedust_get_trades(pool, limit=30) or []
+                    # Endpoint may return oldest->newest; take MAX lt/trade_id as baseline.
+                    max_lt = None
+                    for t in warm:
+                        lt_raw = t.get("lt") or t.get("trade_id")
+                        lt = str(lt_raw or "").strip()
+                        if not lt:
+                            continue
+                        try:
+                            lt_int = int(lt)
+                        except Exception:
+                            continue
+                        if (max_lt is None) or (lt_int > max_lt):
+                            max_lt = lt_int
+                    if max_lt is not None:
+                        token["last_dedust_trade"] = str(max_lt)
+                except Exception:
+                    pass
+                token["last_dedust_ts"] = int(time.time())
+                save_groups()
+                continue
+        
+            last_lt = str(token.get("last_dedust_trade") or "")
+            last_lt_int = _as_int(last_lt, 0)
+        
+            trades = []
+            try:
+                trades = dedust_get_trades(pool, limit=25)
+            except Exception:
+                trades = []
+        
+            newest_lt_int = last_lt_int
+            newest_lt = last_lt
+        
+            for tr in reversed(trades[:25]):
+                lt = str(tr.get("lt") or tr.get("trade_id") or "")
+                lt_int = _as_int(lt, 0)
+                if lt_int and lt_int <= last_lt_int:
+                    continue
+        
+                b = dedust_trade_to_buy(tr)
+                ton_amt = float(b.get("ton") or 0.0)
+                if ton_amt < min_buy:
                     newest_lt_int = max(newest_lt_int, lt_int)
-                    if lt:
-                        newest_lt = lt
-            
-                if newest_lt_int > last_lt_int and newest_lt:
-                    token["last_dedust_trade"] = newest_lt
-                    token["last_dedust_ts"] = int(time.time())
-                    save_groups()
+                    newest_lt = lt if lt else newest_lt
+                    continue
+        
+                await post_buy(app, chat_id, token, b, "DeDust")
+                await update_leaderboard(chat_id, token, str(b.get("buyer") or ""), ton_amt, settings)
+        
+                newest_lt_int = max(newest_lt_int, lt_int)
+                if lt:
+                    newest_lt = lt
+        
+            if newest_lt_int > last_lt_int and newest_lt:
+                token["last_dedust_trade"] = newest_lt
+                token["last_dedust_ts"] = int(time.time())
+                save_groups()
 
 
     # save seen occasionally

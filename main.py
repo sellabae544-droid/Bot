@@ -2014,123 +2014,112 @@ async def poll_once(app: Application):
             burst["window_start"] = now
             burst["count"] = 0
 
-        # STON (STON exported events by blocks)
+        # STON.fi (TonAPI account transactions on pool address)
+        # We avoid relying on STON export feeds because their `pairId` often doesn't match
+        # the on-chain pool address returned by DexScreener/GeckoTerminal.
         if settings.get("enable_ston", True) and token.get("ston_pool"):
-            pool = token["ston_pool"]
+            pool = str(token["ston_pool"]).strip()
             try:
-                latest = await _to_thread(ston_latest_block)
-                if latest is None:
-                    raise RuntimeError("no latest block")
-                # per-token cursor to avoid posting old swaps when a new group configures a token
-                last_block = token.get("ston_last_block")
-                if last_block is None:
-                    # initialize slightly behind to avoid missing
-                    last_block = max(0, int(latest) - 5)
-                from_b = int(last_block) + 1
-                to_b = int(latest)
-                # cap range to avoid huge pulls
-                if to_b - from_b > 60:
-                    from_b = to_b - 60
-                evs = await _to_thread(ston_events, from_b, to_b)
-                # advance cursor even if no events
-                token["ston_last_block"] = to_b
-                # filter swaps for this pool (STON export feed)
-                ton_leg = ensure_ton_leg_for_pool(token)
-                posted_any = False
-                for ev in evs:
-                    if (str(ev.get("eventType") or "").lower() != "swap"):
-                        continue
-                    ignore_before = int(token.get("ignore_before_ts") or 0)
-                    ev_ts = int(ev.get("timestamp") or ev.get("time") or ev.get("ts") or 0)
-                    if ignore_before and ev_ts and ev_ts < ignore_before:
-                        continue
-                    pair_id = str(ev.get("pairId") or "").strip()
-                    if pair_id != pool:
-                        continue
-                    tx = str(ev.get("txnId") or "").strip()
-                    if not tx:
-                        continue
-                    maker = str(ev.get("maker") or "").strip()
-                    a0_in = _to_float(ev.get("amount0In"))
-                    a0_out = _to_float(ev.get("amount0Out"))
-                    a1_in = _to_float(ev.get("amount1In"))
-                    a1_out = _to_float(ev.get("amount1Out"))
-                    ton_spent = 0.0
-                    token_received = 0.0
-                    if ton_leg == 0:
-                        if a0_in > 0 and a1_out > 0:
-                            ton_spent = a0_in
-                            token_received = a1_out
-                        else:
-                            continue
-                    elif ton_leg == 1:
-                        if a1_in > 0 and a0_out > 0:
-                            ton_spent = a1_in
-                            token_received = a0_out
-                        else:
-                            continue
-                    else:
-                        continue
-                    if ton_spent < min_buy:
-                        continue
-                    dedupe_key = f"ston:{pool}:{tx}"
-                    if not dedupe_ok(chat_id, dedupe_key):
-                        continue
-                    if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
-                        continue
-                    burst["count"] += 1
-                    await post_buy(app, chat_id, token, {"tx": tx, "buyer": maker, "ton": ton_spent, "token_amount": token_received}, source="STON.fi")
-                    posted_any = True
+                lim = int(os.getenv("STON_TX_LIMIT", "180"))
+                txs = await _to_thread(tonapi_account_transactions, pool, lim)
+                if not isinstance(txs, list):
+                    txs = []
+                # oldest -> newest
+                txs = list(reversed(txs))
 
-                # Fallback for STON.fi v2 swaps (TonAPI tx actions).
-                # Some v2 pools don't appear in the export feed with matching pairId/fields,
-                # but TonAPI actions still include "Swap tokens" / "Stonfi Swap V2".
-                if not posted_any:
+                try:
+                    last_lt = int(str(token.get("ston_last_lt") or 0))
+                except Exception:
+                    last_lt = 0
+
+                ignore_before = int(token.get("ignore_before_ts") or 0)
+
+                # If no cursor yet and we don't have an ignore_before baseline,
+                # set baselines and skip this cycle to prevent historical spam.
+                if last_lt == 0 and not ignore_before and txs:
+                    newest = txs[-1]
+                    tid = newest.get("transaction_id") or {}
+                    lt_s = str(tid.get("lt") or newest.get("lt") or "").strip()
                     try:
-                        txs = await _to_thread(tonapi_account_transactions, pool, 15)
-                        # process oldest -> newest
-                        txs = list(reversed(txs))
-                        for txo in txs:
-                            ignore_before = int(token.get("ignore_before_ts") or 0)
-                            ut = int(txo.get("utime") or 0)
-                            if ignore_before and ut and ut < ignore_before:
+                        token["ston_last_lt"] = int(lt_s) if lt_s else 0
+                    except Exception:
+                        token["ston_last_lt"] = 0
+                    token["ignore_before_ts"] = int(time.time())
+                    save_groups()
+                    # skip posting in this cycle
+                else:
+                    max_lt = last_lt
+                    for txo in txs:
+                        if not isinstance(txo, dict):
+                            continue
+                        ut = int(txo.get("utime") or 0)
+                        if ignore_before and ut and ut < ignore_before:
+                            continue
+
+                        tid = txo.get("transaction_id") or {}
+                        lt_s = str(tid.get("lt") or txo.get("lt") or "").strip()
+                        try:
+                            lt_i = int(lt_s) if lt_s else 0
+                        except Exception:
+                            lt_i = 0
+
+                        if lt_i and last_lt and lt_i <= last_lt:
+                            continue
+
+                        buys = stonfi_extract_buys_from_tonapi_tx(txo, token["address"])
+                        if not buys:
+                            continue
+
+                        for b in buys:
+                            ton_spent = float(b.get("ton") or 0.0)
+                            # TonAPI sometimes returns nanoTON
+                            if ton_spent > 1e6:
+                                ton_spent = ton_spent / 1e9
+
+                            token_amt = float(b.get("token_amount") or 0.0)
+                            dec = token.get("decimals")
+                            try:
+                                dec_i = int(dec) if dec is not None else None
+                            except Exception:
+                                dec_i = None
+                            # TonAPI often returns jetton amount in minimal units
+                            if dec_i is not None and token_amt > 1e8:
+                                token_amt = token_amt / (10 ** dec_i)
+
+                            if ton_spent < min_buy:
                                 continue
-                            buys = stonfi_extract_buys_from_tonapi_tx(txo, token["address"])
-                            for b in buys:
-                                ton_spent = float(b.get("ton") or 0.0)
-                                # TonAPI sometimes returns nanoTON
-                                if ton_spent > 1e5:
-                                    ton_spent = ton_spent / 1e9
 
-                                token_amt = float(b.get("token_amount") or 0.0)
-                                dec = token.get("decimals")
-                                try:
-                                    dec_i = int(dec) if dec is not None else None
-                                except Exception:
-                                    dec_i = None
-                                # TonAPI often returns jetton amount in minimal units
-                                if dec_i is not None and token_amt > 1e8:
-                                    token_amt = token_amt / (10 ** dec_i)
+                            txh = str(b.get("tx") or "").strip() or _tx_hash(txo)
+                            if not txh:
+                                continue
 
-                                if ton_spent < min_buy:
-                                    continue
-                                txh = str(b.get("tx") or "").strip() or _tx_hash(txo)
-                                buyer = str(b.get("buyer") or "").strip()
-                                dedupe_key = f"ston:{pool}:{txh}"
-                                if not dedupe_ok(chat_id, dedupe_key):
-                                    continue
-                                if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
-                                    continue
-                                burst["count"] += 1
-                                await post_buy(app, chat_id, token, {"tx": txh, "buyer": buyer, "ton": ton_spent, "token_amount": token_amt}, source="STON.fi v2")
+                            dedupe_key = f"ston:{pool}:{txh}"
+                            if not dedupe_ok(chat_id, dedupe_key):
+                                continue
+                            if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
+                                continue
+                            burst["count"] += 1
+
+                            buyer = str(b.get("buyer") or "").strip()
+                            try:
+                                await post_buy(
+                                    app, chat_id, token,
+                                    {"tx": txh, "buyer": buyer, "ton": ton_spent, "token_amount": token_amt},
+                                    source="STON.fi"
+                                )
+                            except Exception as _e:
+                                log.warning("post_buy failed chat=%s source=STON.fi err=%s", chat_id, _e)
+
+                        if lt_i and lt_i > max_lt:
+                            max_lt = lt_i
+
+                    if max_lt and max_lt != last_lt:
+                        token["ston_last_lt"] = int(max_lt)
                         save_groups()
-                    except Exception as _e:
-                        log.debug("STON v2 fallback err chat=%s %s", chat_id, _e)
-                save_groups()
             except Exception as e:
                 log.debug("STON poll err chat=%s %s", chat_id, e)
 
-        # DeDust (DeDust API trades)
+# DeDust (DeDust API trades)
         if settings.get("enable_dedust", True) and token.get("dedust_pool"):
             pool = token["dedust_pool"]
             try:
@@ -2226,13 +2215,16 @@ async def poll_once(app: Application):
                     burst["count"] += 1
 
                     token_amt = float(b.get("token_amount") or 0.0)
-                    await post_buy(app, chat_id, token, {
+                    try:
+                        await post_buy(app, chat_id, token, {
                         "tx": b.get("tx"),
                         "trade_id": str(lt_i or b.get("trade_id") or ""),
                         "buyer": b.get("buyer"),
                         "ton": ton_amt,
                         "token_amount": token_amt,
-                    }, source="DeDust")
+                        }, source="DeDust")
+                    except Exception as _e:
+                        log.warning("post_buy failed chat=%s source=DeDust err=%s", chat_id, _e)
 
                     if lt_i and lt_i > max_seen_lt:
                         max_seen_lt = lt_i
@@ -2272,10 +2264,13 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     dedust_pool = token.get("dedust_pool") or ""
     pool_for_market = ston_pool or dedust_pool
 
+    # Jetton master address (used for token-level fallbacks)
+    jetton_addr = str(token.get("address") or "").strip()
+
     # Market data (prefer GeckoTerminal)
     price_usd = liq_usd = mc_usd = None
     # Try cache first to avoid missing stats (rate limits / temporary failures)
-    market_cache_key = str(pool_for_market or token_addr or "").strip()
+    market_cache_key = str(pool_for_market or jetton_addr or "").strip()
     _mcached = MARKET_CACHE.get(market_cache_key) if market_cache_key else None
     _now = int(time.time())
     if _mcached and _now - int(_mcached.get("ts") or 0) < 900:
@@ -2320,7 +2315,6 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     except Exception:
         holders = None
 
-    jetton_addr = str(token.get("address") or "").strip()
     if jetton_addr:
         # TonAPI Jetton info sometimes includes holders_count. If not, fall back
         # to the dedicated holders endpoint.
@@ -2645,3 +2639,5 @@ def ensure_ton_leg_for_pool(token: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+
+#test

@@ -437,16 +437,41 @@ def tonapi_headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {TONAPI_KEY}", "Accept": "application/json"}
 
 def tonapi_get_raw(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
-    try:
-        res = requests.get(url, headers=tonapi_headers(), params=params, timeout=20)
-        if res.status_code in (401,403) and TONAPI_KEY:
-            # sometimes user sets X-API-Key (toncenter-style)
-            res = requests.get(url, headers={"X-API-Key": TONAPI_KEY, "Accept":"application/json"}, params=params, timeout=20)
-        if res.status_code != 200:
+    """Low-level TonAPI fetch with small retries.
+
+    TonAPI can temporarily rate limit (429) or return transient 5xx. If we fail
+    hard here, the bot will show Holders as N/A and can also miss buys when it
+    relies on TonAPI to resolve tx hashes.
+    """
+    headers_a = tonapi_headers()
+    headers_b = {"X-API-Key": TONAPI_KEY, "Accept": "application/json"} if TONAPI_KEY else None
+    for attempt in range(4):
+        try:
+            res = requests.get(url, headers=headers_a, params=params, timeout=20)
+            if res.status_code in (401, 403) and headers_b:
+                # sometimes user sets X-API-Key (toncenter-style)
+                res = requests.get(url, headers=headers_b, params=params, timeout=20)
+
+            if res.status_code == 200:
+                return res.json()
+
+            # Retry on rate-limit / transient server errors
+            if res.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+                try:
+                    time.sleep(0.35 + 0.25 * attempt)
+                except Exception:
+                    pass
+                continue
+
             return None
-        return res.json()
-    except Exception:
-        return None
+        except Exception:
+            if attempt < 3:
+                try:
+                    time.sleep(0.35 + 0.25 * attempt)
+                except Exception:
+                    pass
+                continue
+            return None
 
 def tonapi_get(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     js = tonapi_get_raw(url, params=params)
@@ -1883,10 +1908,16 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
     gk = gecko_token_info(jetton)
     name = (gk.get("name") or "").strip() if gk else ""
     sym = (gk.get("symbol") or "").strip() if gk else ""
+    holders_seed: Optional[int] = None
     if not name and not sym:
         info = tonapi_jetton_info(jetton)
         name = (info.get("name") or "").strip()
         sym = (info.get("symbol") or "").strip()
+        try:
+            if info.get("holders_count") is not None:
+                holders_seed = int(info.get("holders_count"))
+        except Exception:
+            pass
     if not name and not sym:
         dx = dex_token_info(jetton)
         name = (dx.get("name") or "").strip()
@@ -1913,6 +1944,15 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
     except Exception:
         pass
 
+    # If TonAPI didn't provide holders on the main endpoint, try the holders endpoint once
+    if holders_seed is None:
+        try:
+            h2 = tonapi_jetton_holders_count(jetton)
+            if h2 is not None:
+                holders_seed = int(h2)
+        except Exception:
+            pass
+
     g["token"] = {
         "address": jetton,
         "dex_mode": ("auto" if dex_mode=="both" else dex_mode),
@@ -1923,6 +1963,7 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "set_at": int(time.time()),
         "init_done": False,
         "paused": False,
+        "holders": holders_seed,
         "last_ston_tx": None,
         "last_dedust_trade": None,
         "ston_last_block": None,
@@ -2026,61 +2067,87 @@ async def poll_once(app: Application):
                 if last_block is None:
                     # initialize slightly behind to avoid missing
                     last_block = max(0, int(latest) - 5)
-                from_b = int(last_block) + 1
-                to_b = int(latest)
-                # cap range to avoid huge pulls
-                if to_b - from_b > 60:
-                    from_b = to_b - 60
-                evs = await _to_thread(ston_events, from_b, to_b)
-                # advance cursor even if no events
-                token["ston_last_block"] = to_b
+
                 # filter swaps for this pool (STON export feed)
                 ton_leg = ensure_ton_leg_for_pool(token)
                 posted_any = False
-                for ev in evs:
-                    if (str(ev.get("eventType") or "").lower() != "swap"):
-                        continue
-                    ignore_before = int(token.get("ignore_before_ts") or 0)
-                    ev_ts = int(ev.get("timestamp") or ev.get("time") or ev.get("ts") or 0)
-                    if ignore_before and ev_ts and ev_ts < ignore_before:
-                        continue
-                    pair_id = str(ev.get("pairId") or "").strip()
-                    if pair_id != pool:
-                        continue
-                    tx = str(ev.get("txnId") or "").strip()
-                    if not tx:
-                        continue
-                    maker = str(ev.get("maker") or "").strip()
-                    a0_in = _to_float(ev.get("amount0In"))
-                    a0_out = _to_float(ev.get("amount0Out"))
-                    a1_in = _to_float(ev.get("amount1In"))
-                    a1_out = _to_float(ev.get("amount1Out"))
-                    ton_spent = 0.0
-                    token_received = 0.0
-                    if ton_leg == 0:
-                        if a0_in > 0 and a1_out > 0:
-                            ton_spent = a0_in
-                            token_received = a1_out
+
+                # Fetch in small chunks and only advance cursor after successful fetch.
+                target_block = int(latest)
+                last_block_i = int(last_block or 0)
+                from_b = last_block_i + 1
+                processed_to = last_block_i
+
+                chunk = 25
+                max_blocks_per_cycle = 200  # avoid long cycles; catch up in subsequent polls
+                blocks_done = 0
+
+                while from_b <= target_block and blocks_done < max_blocks_per_cycle:
+                    to_b = min(target_block, from_b + chunk - 1)
+                    evs = await _to_thread(ston_events, from_b, to_b)
+                    if evs is None:
+                        # Do not advance cursor on HTTP/transport failure, otherwise we'd skip buys.
+                        break
+
+                    for ev in evs:
+                        if (str(ev.get("eventType") or "").lower() != "swap"):
+                            continue
+                        ignore_before = int(token.get("ignore_before_ts") or 0)
+                        ev_ts = int(ev.get("timestamp") or ev.get("time") or ev.get("ts") or 0)
+                        if ignore_before and ev_ts and ev_ts < ignore_before:
+                            continue
+                        pair_id = str(ev.get("pairId") or "").strip()
+                        if pair_id != pool:
+                            continue
+                        tx = str(ev.get("txnId") or "").strip()
+                        if not tx:
+                            continue
+                        maker = str(ev.get("maker") or "").strip()
+                        a0_in = _to_float(ev.get("amount0In"))
+                        a0_out = _to_float(ev.get("amount0Out"))
+                        a1_in = _to_float(ev.get("amount1In"))
+                        a1_out = _to_float(ev.get("amount1Out"))
+                        ton_spent = 0.0
+                        token_received = 0.0
+                        if ton_leg == 0:
+                            if a0_in > 0 and a1_out > 0:
+                                ton_spent = a0_in
+                                token_received = a1_out
+                            else:
+                                continue
+                        elif ton_leg == 1:
+                            if a1_in > 0 and a0_out > 0:
+                                ton_spent = a1_in
+                                token_received = a0_out
+                            else:
+                                continue
                         else:
                             continue
-                    elif ton_leg == 1:
-                        if a1_in > 0 and a0_out > 0:
-                            ton_spent = a1_in
-                            token_received = a0_out
-                        else:
+                        if ton_spent < min_buy:
                             continue
-                    else:
-                        continue
-                    if ton_spent < min_buy:
-                        continue
-                    dedupe_key = f"ston:{pool}:{tx}"
-                    if not dedupe_ok(chat_id, dedupe_key):
-                        continue
-                    if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
-                        continue
-                    burst["count"] += 1
-                    await post_buy(app, chat_id, token, {"tx": tx, "buyer": maker, "ton": ton_spent, "token_amount": token_received}, source="STON.fi")
-                    posted_any = True
+                        dedupe_key = f"ston:{pool}:{tx}"
+                        if not dedupe_ok(chat_id, dedupe_key):
+                            continue
+                        if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
+                            continue
+                        burst["count"] += 1
+                        await post_buy(
+                            app,
+                            chat_id,
+                            token,
+                            {"tx": tx, "buyer": maker, "ton": ton_spent, "token_amount": token_received},
+                            source="STON.fi",
+                        )
+                        posted_any = True
+
+                    processed_to = to_b
+                    from_b = to_b + 1
+                    blocks_done += chunk
+
+                # advance cursor only for the range we actually processed
+                if processed_to > last_block_i:
+                    token["ston_last_block"] = int(processed_to)
+                    save_groups()
 
                 # Fallback for STON.fi v2 swaps (TonAPI tx actions).
                 # Some v2 pools don't appear in the export feed with matching pairId/fields,
@@ -2275,6 +2342,8 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     # Market data (prefer GeckoTerminal)
     price_usd = liq_usd = mc_usd = None
     # Try cache first to avoid missing stats (rate limits / temporary failures)
+    # cache key must exist even when no pool resolved
+    token_addr = str(token.get("address") or "").strip()
     market_cache_key = str(pool_for_market or token_addr or "").strip()
     _mcached = MARKET_CACHE.get(market_cache_key) if market_cache_key else None
     _now = int(time.time())
@@ -2604,12 +2673,17 @@ def ston_latest_block() -> Optional[int]:
     except Exception:
         return None
 
-def ston_events(from_block: int, to_block: int) -> List[Dict[str, Any]]:
+def ston_events(from_block: int, to_block: int) -> Optional[List[Dict[str, Any]]]:
+    """Fetch STON export events.
+
+    Returns None on HTTP/transport failure (so callers don't advance cursors and
+    accidentally skip buys), otherwise returns a list (possibly empty).
+    """
     params = {"fromBlock": int(from_block), "toBlock": int(to_block)}
     try:
         r = requests.get(STON_EVENTS_URL, params=params, headers=STON_HEADERS, timeout=20)
         if r.status_code != 200:
-            return []
+            return None
         js = r.json()
         if isinstance(js, list):
             return [x for x in js if isinstance(x, dict)]
@@ -2617,7 +2691,7 @@ def ston_events(from_block: int, to_block: int) -> List[Dict[str, Any]]:
             return [x for x in js["events"] if isinstance(x, dict)]
         return []
     except Exception:
-        return []
+        return None
 
 def ensure_ton_leg_for_pool(token: Dict[str, Any]) -> Optional[int]:
     # cache 0/1 where TON is leg0(amount0*) or leg1(amount1*)
@@ -2642,5 +2716,9 @@ def ensure_ton_leg_for_pool(token: Dict[str, Any]) -> Optional[int]:
         return 1
     return None
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
+    # Running directly (e.g., local dev). In production we start via bot.py.
     main()
+
+

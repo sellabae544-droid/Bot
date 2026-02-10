@@ -1,7 +1,7 @@
 
 import os, json, time, asyncio, logging, re, html, base64
 from typing import Any, Dict, Optional, List, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 import requests
 
 from flask import Flask
@@ -474,6 +474,32 @@ def tonapi_jetton_info(jetton: str) -> Dict[str, Any]:
         pass
     return out
 
+def tonapi_jetton_holders_count(jetton: str) -> Optional[int]:
+    """Best-effort holders count. Some TonAPI responses don't include holders_count on the main jetton endpoint."""
+    try:
+        data = tonapi_get(f"{TONAPI_BASE}/v2/jettons/{jetton}/holders", params={"limit": 1, "offset": 0})
+        if not isinstance(data, dict):
+            return None
+        # TonAPI may return total/total_count in root
+        for k in ("total", "total_count", "count", "holders", "holders_count"):
+            v = data.get(k)
+            if isinstance(v, int):
+                return v
+            if isinstance(v, str) and v.isdigit():
+                return int(v)
+        # or nested
+        meta = data.get("metadata") or {}
+        if isinstance(meta, dict):
+            v = meta.get("total") or meta.get("total_count")
+            if isinstance(v, int):
+                return v
+            if isinstance(v, str) and v.isdigit():
+                return int(v)
+        return None
+    except Exception:
+        return None
+
+
 def tonapi_account_transactions(address: str, limit: int = 12) -> List[Dict[str, Any]]:
     js = tonapi_get(f"{TONAPI_BASE}/v2/blockchain/accounts/{address}/transactions", params={"limit": limit})
     txs = js.get("transactions") if isinstance(js, dict) else None
@@ -773,7 +799,26 @@ def dex_token_info(token_address: str) -> Dict[str, str]:
 
 # -------------------- BUY EXTRACTION (simplified from your working bot) --------------------
 def _tx_hash(tx: Dict[str, Any]) -> str:
-    return str(tx.get("hash") or tx.get("tx_hash") or tx.get("id") or "")
+    """Extract a tx hash from various TonAPI / DEX payload shapes."""
+    if not isinstance(tx, dict):
+        return ""
+    # Common flat keys
+    h = tx.get("hash") or tx.get("tx_hash") or tx.get("transaction_hash") or tx.get("id")
+    if isinstance(h, str) and h.strip():
+        return h.strip()
+    # TonAPI account tx shape: {"transaction_id": {"hash": "...", "lt": "..."}, ...}
+    tid = tx.get("transaction_id")
+    if isinstance(tid, dict):
+        h2 = tid.get("hash") or tid.get("tx_hash")
+        if isinstance(h2, str) and h2.strip():
+            return h2.strip()
+    # Some payloads wrap in {"event": {"tx_hash": ...}}
+    ev = tx.get("event")
+    if isinstance(ev, dict):
+        h3 = ev.get("tx_hash") or ev.get("hash")
+        if isinstance(h3, str) and h3.strip():
+            return h3.strip()
+    return ""
 
 def _normalize_tx_hash_to_hex(h: Any) -> str:
     """Return a 64-char lowercase hex tx hash when possible.
@@ -2242,14 +2287,30 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                     pass
 
     # Holders (best-effort via TonAPI)
-    holders = None
+    # Holders (keep last known value if APIs fail)
+    prev_holders = None
     try:
-        info = tonapi_jetton_info(token.get("address") or "")
-        h = info.get("holders_count")
-        if h is not None:
-            holders = int(h)
+        prev_holders = _cached.get("holders")
     except Exception:
-        holders = None
+        prev_holders = None
+
+    holders = prev_holders
+    jetton_addr = str(token.get("address") or "").strip()
+    if jetton_addr:
+        try:
+            info = tonapi_jetton_info(jetton_addr)
+            h = info.get("holders_count")
+            if h is not None:
+                holders = int(h)
+        except Exception:
+            pass
+        if holders is None:
+            try:
+                h2 = tonapi_jetton_holders_count(jetton_addr)
+                if h2 is not None:
+                    holders = int(h2)
+            except Exception:
+                pass
 
     # Store/refresh cache so later messages don't lose stats
     if market_cache_key:
@@ -2280,7 +2341,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                     if resolved:
                         break
             tx_hex = _normalize_tx_hash_to_hex(resolved) or tx_hex
-    tx_url = f"https://tonviewer.com/transaction/{tx_hex}" if tx_hex else None
+    tx_url = f"https://tonviewer.com/transaction/{tx_hex}" if tx_hex else (f"https://tonviewer.com/transaction/{quote(str(tx))}" if tx else None)
     gt_url = gecko_terminal_pool_url(pair_for_links) if pair_for_links else None
     dex_url = f"https://dexscreener.com/ton/{pair_for_links}" if pair_for_links else None
     # Token telegram button should reflect the token's own link.

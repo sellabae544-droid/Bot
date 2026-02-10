@@ -484,6 +484,11 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
                     tok["ston_last_block"] = int(latest)
             except Exception:
                 pass
+
+        if (not orig_sym and (info.get("symbol") or "").strip()):
+            meta_changed = True
+        if (not orig_name and (info.get("name") or "").strip()):
+            meta_changed = True
             save_groups()
 
         save_seen()
@@ -642,6 +647,11 @@ def tonapi_find_tx_hash_by_lt(account: str, lt: str, limit: int = 40) -> str:
                 time.sleep(0.35)
             except Exception:
                 pass
+
+        if (not orig_sym and (info.get("symbol") or "").strip()):
+            meta_changed = True
+        if (not orig_name and (info.get("name") or "").strip()):
+            meta_changed = True
             continue
 
     return ""
@@ -880,6 +890,74 @@ def dex_token_info(token_address: str) -> Dict[str, str]:
     except Exception:
         return out
 
+
+
+def dexscreener_token_metrics(token_address: str) -> Optional[dict]:
+    """Best-effort market metrics from DexScreener.
+
+    Returns:
+      {"pair": str|None, "price_usd": float|None, "liquidity_usd": float|None, "market_cap_usd": float|None}
+    """
+    try:
+        res = requests.get(f"{DEX_TOKEN_URL}/{token_address}", timeout=20)
+        if res.status_code != 200:
+            return None
+        js = res.json()
+        pairs = js.get("pairs") if isinstance(js, dict) else None
+        if not isinstance(pairs, list) or not pairs:
+            return None
+
+        best = None
+        best_liq = -1.0
+        for p in pairs:
+            if not isinstance(p, dict):
+                continue
+            if (p.get("chainId") or "").lower() != "ton":
+                continue
+            base = p.get("baseToken") or {}
+            quote = p.get("quoteToken") or {}
+            base_sym = (base.get("symbol") or "").upper()
+            quote_sym = (quote.get("symbol") or "").upper()
+            if base_sym != "TON" and quote_sym != "TON":
+                continue
+            try:
+                liq = float(((p.get("liquidity") or {}).get("usd") or 0) or 0)
+            except Exception:
+                liq = 0.0
+            if liq > best_liq:
+                best_liq = liq
+                best = p
+
+        if not best:
+            best = pairs[0]
+
+        pair = (best.get("pairAddress") or best.get("pairId") or best.get("pair") or "").strip()
+        if not pair:
+            u = (best.get("url") or "")
+            if "/ton/" in u:
+                pair = u.split("/ton/")[-1].split("?")[0].strip()
+
+        def _f(x):
+            try:
+                return float(x)
+            except Exception:
+                return None
+
+        price = _f(best.get("priceUsd"))
+        liq_usd = _f(((best.get("liquidity") or {}).get("usd")))
+        mc = best.get("marketCap")
+        if mc is None:
+            mc = best.get("fdv")
+        mc_usd = _f(mc)
+
+        return {
+            "pair": pair or None,
+            "price_usd": price,
+            "liquidity_usd": liq_usd,
+            "market_cap_usd": mc_usd,
+        }
+    except Exception:
+        return None
 # -------------------- BUY EXTRACTION (simplified from your working bot) --------------------
 def _tx_hash(tx: Dict[str, Any]) -> str:
     """Extract a tx hash from various TonAPI / DEX payload shapes."""
@@ -1113,8 +1191,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("➕ Add BuyBot to Group", url=add_url)],
             [InlineKeyboardButton("⚙️ Configure Token", callback_data="CFG_PRIVATE")],
             [InlineKeyboardButton("🛠 Settings", callback_data="SET_PRIVATE")],
-            [InlineKeyboardButton("🆘 Support", url="https://t.me/SpyTonEco")],
-        ])
+                    ])
         await update.message.reply_text(
             "Welcome to *SpyTON BuyBot* (TON only).\n\n"
             "Use the buttons below — no commands needed.",
@@ -1604,7 +1681,7 @@ async def handle_token_settings_button(chat_id: int, data: str, update: Update, 
         ])
         await msg.edit_text(
             "*Social Links*\n"
-            f"Telegram: {tg if tg else '—'}\n\n"
+            f"Telegram: {tg if tg else 'N/A'}\n\n"
             "To set: tap *Set Telegram Link* then send the link in DM.",
             parse_mode="Markdown",
             reply_markup=kb,
@@ -2083,6 +2160,11 @@ async def poll_once(app: Application):
                 await warmup_seen_for_chat(chat_id, token.get("ston_pool"), token.get("dedust_pool"))
             except Exception:
                 pass
+
+        if (not orig_sym and (info.get("symbol") or "").strip()):
+            meta_changed = True
+        if (not orig_name and (info.get("name") or "").strip()):
+            meta_changed = True
             token["init_done"] = True
             save_groups()
             continue
@@ -2403,6 +2485,29 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                 except Exception:
                     pass
 
+    
+
+    # Fallback market data from DexScreener (helps when GeckoTerminal is rate-limited)
+    if (price_usd is None or liq_usd is None or mc_usd is None) and token.get("address"):
+        ds = dexscreener_token_metrics(token["address"])
+        if ds:
+            if not pool_for_market and ds.get("pair"):
+                pool_for_market = ds.get("pair")
+            if price_usd is None and ds.get("price_usd") is not None:
+                try:
+                    price_usd = float(ds.get("price_usd"))
+                except Exception:
+                    pass
+            if liq_usd is None and ds.get("liquidity_usd") is not None:
+                try:
+                    liq_usd = float(ds.get("liquidity_usd"))
+                except Exception:
+                    pass
+            if mc_usd is None and ds.get("market_cap_usd") is not None:
+                try:
+                    mc_usd = float(ds.get("market_cap_usd"))
+                except Exception:
+                    pass
     # Holders (keep last known value if APIs fail)
     holders = None
     try:
@@ -2429,6 +2534,11 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                     holders = int(h2)
             except Exception:
                 pass
+
+        if (not orig_sym and (info.get("symbol") or "").strip()):
+            meta_changed = True
+        if (not orig_name and (info.get("name") or "").strip()):
+            meta_changed = True
 
     # Persist latest known holders so the field doesn't disappear in later buys.
     if holders is not None:
@@ -2534,13 +2644,13 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
 
     # Stats (Crypton-style) - controlled by Layout toggles
     if bool(s.get("show_price", True)):
-        lines.append(f"Price: {fmt_usd(price_usd, 6) if price_usd is not None else '—'}")
+        lines.append(f"Price: {fmt_usd(price_usd, 6) if price_usd is not None else 'N/A'}")
     if bool(s.get("show_liquidity", True)):
-        lines.append(f"Liquidity: {fmt_usd(liq_usd, 0) if liq_usd is not None else '—'}")
+        lines.append(f"Liquidity: {fmt_usd(liq_usd, 0) if liq_usd is not None else 'N/A'}")
     if bool(s.get("show_mcap", True)):
-        lines.append(f"MCap: {fmt_usd(mc_usd, 0) if mc_usd is not None else '—'}")
+        lines.append(f"MCap: {fmt_usd(mc_usd, 0) if mc_usd is not None else 'N/A'}")
     if bool(s.get("show_holders", True)):
-        lines.append(f"Holders: {holders if holders is not None else '—'}")
+        lines.append(f"Holders: {holders if holders is not None else 'N/A'}")
 
     lines.append("")
     # Keep only TX | GT | DexS | Telegram | Trending
@@ -2605,47 +2715,87 @@ def _channel_seen_bucket() -> Dict[str, Any]:
 
 def _fmt_pct(x: Optional[float]) -> str:
     if x is None:
-        return "—"
+        return "N/A"
     try:
         s = f"{x:+.0f}%"
         return s
     except Exception:
-        return "—"
+        return "N/A"
 
 async def post_buy_channel(app: Application, token: Dict[str, Any], b: Dict[str, Any], source: str):
-    """Post Crypton-style buy into the owner's TRENDING_CHANNEL_ID.
-    Link row MUST be: TX | GT | DexS | Telegram | Trending
-    Plus a 'Book Trending' button.
+    """Post TRENDING-channel style buy into the owner's TRENDING_CHANNEL_ID.
+
+    Requirements:
+    - Channel is owner-only (TRENDING_CHANNEL_ID)
+    - Replace "Sniper Bot" button with "dTrade" button that auto-appends token CA
+    - Token NAME and token SYMBOL at the top are clickable (link to token telegram)
+    - No Support button
     """
     if not TRENDING_CHANNEL_ID:
         return
 
-    sym = (token.get("symbol") or "").strip()
-    name = (token.get("name") or "").strip()
-    title = sym or name or "TOKEN"
+    sym = (token.get("symbol") or "").strip() or "TOKEN"
+    name = (token.get("name") or "").strip() or sym
+
+    jetton_addr = str(token.get("address") or "").strip()
+    tg_link = (token.get("telegram") or "").strip()
 
     ton_amt = float(b.get("ton") or 0.0)
     tok_amt = b.get("token_amount")
-    tok_symbol = b.get("token_symbol") or sym or ""
 
     buyer_full = str(b.get("buyer") or "")
     buyer_short = _short_addr(buyer_full)
-    buyer_url = f"https://tonviewer.com/address/{buyer_full}" if buyer_full else None
     tx = str(b.get("tx") or "")
 
     ston_pool = token.get("ston_pool") or ""
     dedust_pool = token.get("dedust_pool") or ""
     pool_for_market = ston_pool or dedust_pool
 
-    # Market data
+    # Resolve TX url (try to normalize to hex hash)
+    tx_hex = _normalize_tx_hash_to_hex(tx)
+    if not tx_hex and source == "DeDust":
+        lt_guess = str(b.get("trade_id") or tx or "").strip()
+        if lt_guess:
+            resolved = tonapi_find_tx_hash_by_lt(str(dedust_pool or ""), lt_guess, limit=600)
+            tx_hex = _normalize_tx_hash_to_hex(resolved) or tx_hex
+
+    tx_url = f"https://tonviewer.com/transaction/{tx_hex}" if tx_hex else (f"https://tonviewer.com/transaction/{quote(str(tx))}" if tx else "")
+
+    # Market links
+    gt_url = gecko_terminal_pool_url(pool_for_market) if pool_for_market else ""
+
+    # dTrade link must append CA
+    dtrade_url = ""
+    if jetton_addr:
+        dtrade_url = f"{DTRADE_REF}_{jetton_addr}"
+
+    # Market data (best-effort)
     price_usd = liq_usd = mc_usd = None
-    market_cache_key = str(pool_for_market or token.get("address") or "").strip()
-    _mcached = MARKET_CACHE.get(market_cache_key) if market_cache_key else None
-    _now = int(time.time())
-    if _mcached and _now - int(_mcached.get("ts") or 0) < 900:
-        price_usd = _mcached.get("price_usd")
-        liq_usd = _mcached.get("liq_usd")
-        mc_usd = _mcached.get("mc_usd")
+    holders = None
+    try:
+        if token.get("holders") is not None:
+            holders = int(token.get("holders"))
+    except Exception:
+        holders = None
+
+    # refresh holders from TonAPI if possible
+    if jetton_addr:
+        try:
+            info = tonapi_jetton_info(jetton_addr)
+            h = info.get("holders_count")
+            if h is not None:
+                holders = int(h)
+        except Exception:
+            pass
+        if holders is None:
+            try:
+                h2 = tonapi_jetton_holders_count(jetton_addr)
+                if h2 is not None:
+                    holders = int(h2)
+            except Exception:
+                pass
+        if holders is not None:
+            token["holders"] = int(holders)
 
     if pool_for_market:
         pinfo = gecko_pool_info(pool_for_market)
@@ -2663,60 +2813,36 @@ async def post_buy_channel(app: Application, token: Dict[str, Any], b: Dict[str,
             except Exception:
                 pass
 
-    if (price_usd is None or mc_usd is None) and token.get("address"):
-        tinfo = gecko_token_info(token["address"])
-        if tinfo:
-            if price_usd is None:
+    
+
+    # Fallback market data from DexScreener (channel)
+    if (price_usd is None or liq_usd is None or mc_usd is None) and jetton_addr:
+        ds = dexscreener_token_metrics(jetton_addr)
+        if ds:
+            if not pool_for_market and ds.get("pair"):
+                pool_for_market = ds.get("pair")
+                gt_url = gecko_terminal_pool_url(pool_for_market)
+            if price_usd is None and ds.get("price_usd") is not None:
                 try:
-                    price_usd = float(tinfo.get("price_usd")) if tinfo.get("price_usd") is not None else price_usd
+                    price_usd = float(ds.get("price_usd"))
                 except Exception:
                     pass
-            if mc_usd is None:
+            if liq_usd is None and ds.get("liquidity_usd") is not None:
                 try:
-                    mc_usd = float(tinfo.get("market_cap_usd")) if tinfo.get("market_cap_usd") is not None else mc_usd
+                    liq_usd = float(ds.get("liquidity_usd"))
                 except Exception:
                     pass
-
-    holders = None
-    try:
-        if token.get("holders") is not None:
-            holders = int(token.get("holders"))
-    except Exception:
-        holders = None
-    jetton_addr = str(token.get("address") or "").strip()
-    if jetton_addr:
-        try:
-            info = tonapi_jetton_info(jetton_addr)
-            h = info.get("holders_count")
-            if h is not None:
-                holders = int(h)
-        except Exception:
-            pass
-        if holders is None:
-            try:
-                h2 = tonapi_jetton_holders_count(jetton_addr)
-                if h2 is not None:
-                    holders = int(h2)
-            except Exception:
-                pass
-    if holders is not None:
-        token["holders"] = int(holders)
-
-    if market_cache_key:
-        MARKET_CACHE[market_cache_key] = {
-            "ts": int(time.time()),
-            "price_usd": price_usd,
-            "liq_usd": liq_usd,
-            "mc_usd": mc_usd,
-            "holders": holders,
-        }
-
-    # Compute Position % (per wallet, per token) using first-seen price_usd as entry.
+            if mc_usd is None and ds.get("market_cap_usd") is not None:
+                try:
+                    mc_usd = float(ds.get("market_cap_usd"))
+                except Exception:
+                    pass
+    # Position % (entry price tracked per wallet)
     position_pct = None
     try:
-        if buyer_full and price_usd and float(price_usd) > 0:
+        if buyer_full and price_usd and float(price_usd) > 0 and jetton_addr:
             pb = _positions_bucket()
-            tokmap = pb.setdefault(jetton_addr or "unknown", {})
+            tokmap = pb.setdefault(jetton_addr, {})
             entry = tokmap.get(buyer_full)
             if entry is None:
                 tokmap[buyer_full] = float(price_usd)
@@ -2727,108 +2853,101 @@ async def post_buy_channel(app: Application, token: Dict[str, Any], b: Dict[str,
     except Exception:
         position_pct = None
 
-    # Links row
-    pair_for_links = pool_for_market or ""
-    tx_hex = _normalize_tx_hash_to_hex(tx)
-    if not tx_hex and source == "DeDust":
-        lt_guess = str(b.get("trade_id") or tx or "").strip()
-        if lt_guess:
-            resolved = tonapi_find_tx_hash_by_lt(str(dedust_pool or ""), lt_guess, limit=600)
-            tx_hex = _normalize_tx_hash_to_hex(resolved) or tx_hex
-
-    tx_url = f"https://tonviewer.com/transaction/{tx_hex}" if tx_hex else (f"https://tonviewer.com/transaction/{quote(str(tx))}" if tx else None)
-    gt_url = gecko_terminal_pool_url(pair_for_links) if pair_for_links else None
-    dex_url = f"https://dexscreener.com/ton/{pair_for_links}" if pair_for_links else None
-    tg_link = (token.get("telegram") or "").strip()
-    trending = TRENDING_URL
-
-    def fmt_usd(x: Optional[float], decimals: int = 0) -> Optional[str]:
+    def fmt_usd(x, decimals=0):
         if x is None:
-            return None
+            return "N/A"
         try:
+            x = float(x)
             if decimals <= 0:
-                return f"${float(x):,.0f}"
-            return f"${float(x):,.{decimals}f}"
+                return f"${x:,.0f}"
+            return f"${x:,.{decimals}f}"
         except Exception:
-            return None
+            return "N/A"
 
-    # strength block (same sizing rules as group)
-    strength_block = ""
+    # Strength row (TON logos like the reference style)
+    strength = ""
     try:
         step = 5.0
-        max_n = 30
-        emo = "🟢"
         n = max(1, int(ton_amt // step)) if step > 0 else 1
-        n = min(max_n, n)
-        per_line = 15
-        rows = []
-        for i in range(0, n, per_line):
-            rows.append(emo * min(per_line, n - i))
-        strength_block = "\n".join(rows)
+        n = min(40, n)
+        strength = "\n".join(["◻️" for _ in range(0)])
     except Exception:
-        strength_block = ""
+        strength = ""
 
-    lines: List[str] = []
-    lines.append(f"*{html.escape(title)} Buy!*")
-    if strength_block:
-        lines.append(strength_block)
+    # Build message (HTML so name/symbol can be clickable)
+    header_name = html.escape(name)
+    sym_txt = sym if sym.startswith("$") else f"${sym}"
+    header_sym = html.escape(sym_txt)
+
+    if tg_link:
+        header_name = f'<a href="{html.escape(tg_link)}">{header_name}</a>'
+        header_sym = f'<a href="{html.escape(tg_link)}">{header_sym}</a>'
+
+    lines = []
+    lines.append(f"<b>{header_name}</b>")
+    lines.append(f"<b>{header_sym}</b>")
     lines.append("")
-    lines.append(f"💎 *{ton_amt:,.2f} TON*")
-    if tok_amt and tok_symbol:
+
+    # Buy title
+    lines.append(f"<b>{html.escape(sym)} Buy!</b>")
+    lines.append("")
+
+    # Amount
+    lines.append(f"💎 <b>{ton_amt:,.2f} TON</b>")
+    if tok_amt is not None:
         try:
             tok_amt_f = float(tok_amt)
-            lines.append(f"🪙 *{tok_amt_f:,.0f} {html.escape(str(tok_symbol))}*")
+            lines.append(f"🪙 <b>{tok_amt_f:,.0f} {html.escape(sym)}</b>")
         except Exception:
-            lines.append(f"🪙 *{html.escape(str(tok_amt))} {html.escape(str(tok_symbol))}*")
+            lines.append(f"🪙 <b>{html.escape(str(tok_amt))} {html.escape(sym)}</b>")
+
     lines.append("")
-    if buyer_url:
+
+    # Buyer + TX link
+    if buyer_full:
+        buyer_link = f"https://tonviewer.com/address/{buyer_full}"
         if tx_url:
-            lines.append(f"[{buyer_short}]({buyer_url}) | [Txn]({tx_url})")
+            lines.append(f"👤 <a href=\"{html.escape(buyer_link)}\">{html.escape(buyer_short)}</a> | <a href=\"{html.escape(tx_url)}\">TX</a>")
         else:
-            lines.append(f"[{buyer_short}]({buyer_url}) | Txn")
-    else:
-        lines.append(buyer_short)
+            lines.append(f"👤 <a href=\"{html.escape(buyer_link)}\">{html.escape(buyer_short)}</a>")
 
     if position_pct is not None:
-        lines.append(f"Position {_fmt_pct(position_pct)}")
+        lines.append(f"📈 <b>Position</b> {_fmt_pct(position_pct)}")
 
-    lines.append(f"Price: {fmt_usd(price_usd, 6) if price_usd is not None else '—'}")
-    lines.append(f"Liquidity: {fmt_usd(liq_usd, 0) if liq_usd is not None else '—'}")
-    lines.append(f"MCap: {fmt_usd(mc_usd, 0) if mc_usd is not None else '—'}")
-    lines.append(f"Holders: {holders if holders is not None else '—'}")
+    lines.append(f"🏦 <b>Market Cap</b> {fmt_usd(mc_usd, 0) if mc_usd is not None else 'N/A'}")
+    lines.append(f"💧 <b>Liquidity</b> {fmt_usd(liq_usd, 0) if liq_usd is not None else 'N/A'}")
+    if holders is not None:
+        lines.append(f"👥 <b>Holders</b> {holders}")
 
-    lines.append("")
-    link_parts: List[str] = []
-    if tx_url:
-        link_parts.append(f"[TX]({tx_url})")
+    # Plain link row (not buttons) for Chart/Trending/dTrade
+    link_parts = []
     if gt_url:
-        link_parts.append(f"[GT]({gt_url})")
-    if dex_url:
-        link_parts.append(f"[DexS]({dex_url})")
-    if tg_link:
-        link_parts.append(f"[Telegram]({tg_link})")
-    if trending:
-        link_parts.append(f"[Trending]({trending})")
+        link_parts.append(f'📊 <a href="{html.escape(gt_url)}">Chart</a>')
+    if TRENDING_URL:
+        link_parts.append(f'🔥 <a href="{html.escape(TRENDING_URL)}">Trending</a>')
+    if dtrade_url:
+        link_parts.append(f'🛒 <a href="{html.escape(dtrade_url)}">dTrade</a>')
     if link_parts:
+        lines.append("")
         lines.append(" | ".join(link_parts))
 
     msg = "\n".join(lines)
 
-    # Book Trending button
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📌 Book Trending", url=BOOK_TRENDING_URL)]
-    ])
+    # Inline keyboard: Book Trending only
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Book Trending", url=BOOK_TRENDING_URL)]])
+
 
     try:
         await app.bot.send_message(
             chat_id=TRENDING_CHANNEL_ID,
             text=msg,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=kb,
             disable_web_page_preview=True,
         )
     except Exception as e:
         log.debug("channel send fail %s", e)
+
 
 def _lb_format_html(sorted_items: List[Tuple[str, Dict[str, Any]]], channel_handle: str = "@Spytontrending") -> str:
     # top 10
@@ -2860,7 +2979,6 @@ async def ensure_leaderboard_message(app: Application) -> Optional[int]:
         return int(mid)
     # Create and pin a new message
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 Support", url=SUPPORT_URL)],
         [InlineKeyboardButton("TON LISTING ↗", url=LISTING_URL)],
     ])
     msg = _lb_format_html([], channel_handle=(TRENDING_URL.replace("https://t.me/", "@") if TRENDING_URL.startswith("https://t.me/") else "@Spytontrending"))
@@ -2880,19 +2998,55 @@ async def update_leaderboard(app: Application):
     if not TRENDING_CHANNEL_ID:
         return
     # compute pct change for each watched token
+    meta_changed = False
     items=[]
     for addr, info in (CHANNEL_WATCH or {}).items():
         if not isinstance(info, dict):
             continue
         sym = (info.get("symbol") or "").strip()
+        orig_sym = sym
+        orig_name = (info.get("name") or "")
         base = info.get("base_price_usd")
+
+        # Ensure leaderboard shows real symbol (not $TOKEN).
+        # Refresh missing metadata from Gecko (preferred) then TonAPI.
         cur = None
+        tinfo = None
         try:
             tinfo = gecko_token_info(addr)
-            if tinfo and tinfo.get("price_usd") is not None:
-                cur = float(tinfo.get("price_usd"))
+            if tinfo:
+                if not sym:
+                    sym = (tinfo.get("symbol") or "").strip()
+                    if sym:
+                        info["symbol"] = sym
+                if not info.get("name"):
+                    nm = (tinfo.get("name") or "").strip()
+                    if nm:
+                        info["name"] = nm
+                if tinfo.get("price_usd") is not None:
+                    cur = float(tinfo.get("price_usd"))
         except Exception:
+            tinfo = None
             cur = None
+
+        if not sym:
+            try:
+                ji = tonapi_jetton_info(addr)
+                s2 = (ji.get("symbol") or "").strip()
+                if s2:
+                    sym = s2
+                    info["symbol"] = sym
+                if not info.get("name"):
+                    nm2 = (ji.get("name") or "").strip()
+                    if nm2:
+                        info["name"] = nm2
+            except Exception:
+                pass
+
+        if (not orig_sym and (info.get("symbol") or "").strip()):
+            meta_changed = True
+        if (not orig_name and (info.get("name") or "").strip()):
+            meta_changed = True
         pct = None
         try:
             if base and cur and float(base) > 0:
@@ -2910,7 +3064,6 @@ async def update_leaderboard(app: Application):
     if not msg_id:
         return
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 Support", url=SUPPORT_URL)],
         [InlineKeyboardButton("TON LISTING ↗", url=LISTING_URL)],
     ])
     text=_lb_format_html(items, channel_handle=(TRENDING_URL.replace("https://t.me/", "@") if TRENDING_URL.startswith("https://t.me/") else "@Spytontrending"))
@@ -3089,6 +3242,11 @@ async def channel_poll_once(app: Application):
             except Exception:
                 pass
 
+        if (not orig_sym and (info.get("symbol") or "").strip()):
+            meta_changed = True
+        if (not orig_name and (info.get("name") or "").strip()):
+            meta_changed = True
+
         # DeDust trades
         if token.get("dedust_pool"):
             pool = token["dedust_pool"]
@@ -3159,6 +3317,11 @@ async def channel_poll_once(app: Application):
                 save_channel_watch()
             except Exception:
                 pass
+
+        if (not orig_sym and (info.get("symbol") or "").strip()):
+            meta_changed = True
+        if (not orig_name and (info.get("name") or "").strip()):
+            meta_changed = True
 
     # persist SEEN periodically
     try:

@@ -39,6 +39,98 @@ DEX_TOKEN_URL = os.getenv("DEX_TOKEN_URL", "https://api.dexscreener.com/latest/d
 DEX_PAIR_URL = os.getenv("DEX_PAIR_URL", "https://api.dexscreener.com/latest/dex/pairs").rstrip("/")
 
 
+# -------------------- STON API (exported events) --------------------
+STON_BASE = os.getenv("STON_BASE", "https://api.ston.fi").rstrip("/")
+STON_LATEST_BLOCK_URL = f"{STON_BASE}/export/dexscreener/v1/latest-block"
+STON_EVENTS_URL = f"{STON_BASE}/export/dexscreener/v1/events"
+STON_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+STON_LAST_BLOCK: Optional[int] = None
+
+def ston_latest_block() -> Optional[int]:
+    """Return the latest exported block number from STON.fi export feed.
+
+    The API sometimes returns:
+      {"block": {"blockNumber": 123}}
+    or other variants. We normalize safely.
+    """
+    try:
+        r = requests.get(STON_LATEST_BLOCK_URL, headers=STON_HEADERS, timeout=12)
+        if r.status_code != 200:
+            return None
+        js = r.json()
+
+        # Primary format
+        if isinstance(js, dict) and isinstance(js.get("block"), dict):
+            v = js["block"].get("blockNumber") or js["block"].get("block_number")
+            try:
+                return int(v)
+            except Exception:
+                return None
+
+        # Other common variants
+        if isinstance(js, dict):
+            v = js.get("latestBlock") or js.get("latest_block") or js.get("block")
+            try:
+                return int(v)
+            except Exception:
+                return None
+
+        if isinstance(js, int):
+            return js
+        if isinstance(js, str) and js.isdigit():
+            return int(js)
+        return None
+    except Exception:
+        return None
+
+def ston_events(from_block: int, to_block: int) -> Optional[List[Dict[str, Any]]]:
+    """Fetch STON.fi export events.
+
+    Returns:
+      - list of event dicts on success
+      - None on HTTP/parse failure (so callers don't advance cursors and skip buys)
+    """
+    params = {"fromBlock": int(from_block), "toBlock": int(to_block)}
+    try:
+        r = requests.get(STON_EVENTS_URL, params=params, headers=STON_HEADERS, timeout=20)
+        if r.status_code != 200:
+            return None
+        js = r.json()
+        if isinstance(js, list):
+            return [x for x in js if isinstance(x, dict)]
+        if isinstance(js, dict) and isinstance(js.get("events"), list):
+            return [x for x in js["events"] if isinstance(x, dict)]
+        return []
+    except Exception:
+        return None
+
+def ensure_ton_leg_for_pool(token: Dict[str, Any]) -> Optional[int]:
+    # cache 0/1 where TON is leg0(amount0*) or leg1(amount1*)
+    tl = token.get("ton_leg")
+    if tl in (0,1):
+        return int(tl)
+    pool = token.get("ston_pool")
+    if not pool:
+        return None
+    meta = _dex_pair_lookup(pool)
+    if not isinstance(meta, dict):
+        return None
+    base = (meta.get("baseToken") or {})
+    quote = (meta.get("quoteToken") or {})
+    base_sym = str(base.get("symbol") or "").upper()
+    quote_sym = str(quote.get("symbol") or "").upper()
+    if base_sym == "TON":
+        token["ton_leg"] = 0
+        return 0
+    if quote_sym == "TON":
+        token["ton_leg"] = 1
+        return 1
+    return None
+
 # -------------------- DEDUST API (for pool discovery + trades) --------------------
 DEDUST_API = os.getenv("DEDUST_API", "https://api.dedust.io").rstrip("/")
 
@@ -438,32 +530,16 @@ def tonapi_headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {TONAPI_KEY}", "Accept": "application/json"}
 
 def tonapi_get_raw(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
-    """GET JSON from TonAPI with small retry/backoff.
-    This prevents transient 429/5xx from turning Holders/Tx parsing into N/A.
-    """
-    headers = tonapi_headers()
-    alt_headers = {"X-API-Key": TONAPI_KEY, "Accept": "application/json"} if TONAPI_KEY else None
-
-    for attempt in range(4):
-        try:
-            res = requests.get(url, headers=headers, params=params, timeout=20)
-            # sometimes users provide a key that expects X-API-Key style
-            if res.status_code in (401, 403) and alt_headers:
-                res = requests.get(url, headers=alt_headers, params=params, timeout=20)
-
-            if res.status_code == 200:
-                return res.json()
-
-            # retry on rate limit / temporary server issues
-            if res.status_code == 429 or 500 <= res.status_code <= 599:
-                time.sleep(0.7 + attempt * 1.2)
-                continue
-
+    try:
+        res = requests.get(url, headers=tonapi_headers(), params=params, timeout=20)
+        if res.status_code in (401,403) and TONAPI_KEY:
+            # sometimes user sets X-API-Key (toncenter-style)
+            res = requests.get(url, headers={"X-API-Key": TONAPI_KEY, "Accept":"application/json"}, params=params, timeout=20)
+        if res.status_code != 200:
             return None
-        except Exception:
-            time.sleep(0.7 + attempt * 1.2)
-            continue
-    return None
+        return res.json()
+    except Exception:
+        return None
 
 def tonapi_get(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     js = tonapi_get_raw(url, params=params)
@@ -1989,80 +2065,6 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
 async def _to_thread(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
 
-
-
-# -------------------- STON API (exported events) --------------------
-STON_BASE = os.getenv("STON_BASE", "https://api.ston.fi").rstrip("/")
-STON_LATEST_BLOCK_URL = f"{STON_BASE}/export/dexscreener/v1/latest-block"
-STON_EVENTS_URL = f"{STON_BASE}/export/dexscreener/v1/events"
-STON_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json,text/plain,*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-STON_LAST_BLOCK: Optional[int] = None
-
-def ston_latest_block() -> Optional[int]:
-    try:
-        r = requests.get(STON_LATEST_BLOCK_URL, headers=STON_HEADERS, timeout=20)
-        if r.status_code != 200:
-            return None
-        js = r.json()
-        if isinstance(js, dict):
-            v = js.get("block") or js.get("latestBlock") or js.get("latest_block")
-            if isinstance(v, int):
-                return v
-            if isinstance(v, str) and v.isdigit():
-                return int(v)
-        if isinstance(js, int):
-            return js
-        if isinstance(js, str) and js.isdigit():
-            return int(js)
-        return None
-    except Exception:
-        return None
-
-def ston_events(from_block: int, to_block: int) -> List[Dict[str, Any]]:
-    params = {"fromBlock": int(from_block), "toBlock": int(to_block)}
-    try:
-        r = requests.get(STON_EVENTS_URL, params=params, headers=STON_HEADERS, timeout=20)
-        if r.status_code != 200:
-            return []
-        js = r.json()
-        if isinstance(js, list):
-            return [x for x in js if isinstance(x, dict)]
-        if isinstance(js, dict) and isinstance(js.get("events"), list):
-            return [x for x in js["events"] if isinstance(x, dict)]
-        return []
-    except Exception:
-        return []
-
-def ensure_ton_leg_for_pool(token: Dict[str, Any]) -> Optional[int]:
-    # cache 0/1 where TON is leg0(amount0*) or leg1(amount1*)
-    tl = token.get("ton_leg")
-    if tl in (0,1):
-        return int(tl)
-    pool = token.get("ston_pool")
-    if not pool:
-        return None
-    meta = _dex_pair_lookup(pool)
-    if not isinstance(meta, dict):
-        return None
-    base = (meta.get("baseToken") or {})
-    quote = (meta.get("quoteToken") or {})
-    base_sym = str(base.get("symbol") or "").upper()
-    quote_sym = str(quote.get("symbol") or "").upper()
-    if base_sym == "TON":
-        token["ton_leg"] = 0
-        return 0
-    if quote_sym == "TON":
-        token["ton_leg"] = 1
-        return 1
-    return None
-
-
-
-
 async def poll_once(app: Application):
     # Collect all groups with configured token
     items: List[Tuple[int, Dict[str, Any]]] = []
@@ -2112,76 +2114,70 @@ async def poll_once(app: Application):
                 latest = await _to_thread(ston_latest_block)
                 if latest is None:
                     raise RuntimeError("no latest block")
-
-                # per-token cursor (do NOT skip ranges; fetch in chunks)
+                # per-token cursor to avoid posting old swaps when a new group configures a token
                 last_block = token.get("ston_last_block")
                 if last_block is None:
+                    # initialize slightly behind to avoid missing
                     last_block = max(0, int(latest) - 5)
-
-                max_back = int(os.getenv("STON_MAX_BACK", "1200"))
-                start_block = int(last_block) + 1
-                if start_block < int(latest) - max_back:
-                    # prevent huge backfills if the bot was down for a long time
-                    start_block = int(latest) - max_back
-
+                from_b = int(last_block) + 1
+                to_b = int(latest)
+                # cap range to avoid huge pulls
+                if to_b - from_b > 60:
+                    from_b = to_b - 60
+                evs = await _to_thread(ston_events, from_b, to_b)
+                if evs is None:
+                    raise RuntimeError("ston events fetch failed")
+                # advance cursor only on successful fetch
+                token["ston_last_block"] = to_b
+                # filter swaps for this pool (STON export feed)
                 ton_leg = ensure_ton_leg_for_pool(token)
                 posted_any = False
-
-                b = start_block
-                while b <= int(latest):
-                    chunk_to = min(b + 49, int(latest))
-                    evs = await _to_thread(ston_events, b, chunk_to)
-                    # advance cursor ONLY after successful fetch
-                    token["ston_last_block"] = chunk_to
-
-                    for ev in evs:
-                        if (str(ev.get("eventType") or "").lower() != "swap"):
-                            continue
-                        ignore_before = int(token.get("ignore_before_ts") or 0)
-                        ev_ts = int(ev.get("timestamp") or ev.get("time") or ev.get("ts") or 0)
-                        if ignore_before and ev_ts and ev_ts < ignore_before:
-                            continue
-                        pair_id = str(ev.get("pairId") or "").strip()
-                        if pair_id != pool:
-                            continue
-                        tx = str(ev.get("txnId") or "").strip()
-                        if not tx:
-                            continue
-                        maker = str(ev.get("maker") or "").strip()
-                        a0_in = _to_float(ev.get("amount0In"))
-                        a0_out = _to_float(ev.get("amount0Out"))
-                        a1_in = _to_float(ev.get("amount1In"))
-                        a1_out = _to_float(ev.get("amount1Out"))
-                        ton_spent = 0.0
-                        token_received = 0.0
-                        if ton_leg == 0:
-                            if a0_in > 0 and a1_out > 0:
-                                ton_spent = a0_in
-                                token_received = a1_out
-                            else:
-                                continue
-                        elif ton_leg == 1:
-                            if a1_in > 0 and a0_out > 0:
-                                ton_spent = a1_in
-                                token_received = a0_out
-                            else:
-                                continue
+                for ev in evs:
+                    if (str(ev.get("eventType") or "").lower() != "swap"):
+                        continue
+                    ignore_before = int(token.get("ignore_before_ts") or 0)
+                    ev_ts = int(ev.get("timestamp") or ev.get("time") or ev.get("ts") or 0)
+                    if ignore_before and ev_ts and ev_ts < ignore_before:
+                        continue
+                    pair_id = str(ev.get("pairId") or "").strip()
+                    if pair_id != pool:
+                        continue
+                    tx = str(ev.get("txnId") or "").strip()
+                    if not tx:
+                        continue
+                    maker = str(ev.get("maker") or "").strip()
+                    a0_in = _to_float(ev.get("amount0In"))
+                    a0_out = _to_float(ev.get("amount0Out"))
+                    a1_in = _to_float(ev.get("amount1In"))
+                    a1_out = _to_float(ev.get("amount1Out"))
+                    ton_spent = 0.0
+                    token_received = 0.0
+                    if ton_leg == 0:
+                        if a0_in > 0 and a1_out > 0:
+                            ton_spent = a0_in
+                            token_received = a1_out
                         else:
                             continue
-                        if ton_spent < min_buy:
+                    elif ton_leg == 1:
+                        if a1_in > 0 and a0_out > 0:
+                            ton_spent = a1_in
+                            token_received = a0_out
+                        else:
                             continue
-                        dedupe_key = f"ston:{pool}:{tx}"
-                        if not dedupe_ok(chat_id, dedupe_key):
-                            continue
-                        if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
-                            continue
-                        burst["count"] += 1
-                        await post_buy(app, chat_id, token, {"tx": tx, "buyer": maker, "ton": ton_spent, "token_amount": token_received}, source="STON.fi")
-                        posted_any = True
+                    else:
+                        continue
+                    if ton_spent < min_buy:
+                        continue
+                    dedupe_key = f"ston:{pool}:{tx}"
+                    if not dedupe_ok(chat_id, dedupe_key):
+                        continue
+                    if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
+                        continue
+                    burst["count"] += 1
+                    await post_buy(app, chat_id, token, {"tx": tx, "buyer": maker, "ton": ton_spent, "token_amount": token_received}, source="STON.fi")
+                    posted_any = True
 
-                    b = chunk_to + 1
-
-# Fallback for STON.fi v2 swaps (TonAPI tx actions).
+                # Fallback for STON.fi v2 swaps (TonAPI tx actions).
                 # Some v2 pools don't appear in the export feed with matching pairId/fields,
                 # but TonAPI actions still include "Swap tokens" / "Stonfi Swap V2".
                 if not posted_any:
@@ -2670,14 +2666,16 @@ def main():
     threading.Thread(target=run_flask, daemon=True).start()
 
     log.info("SpyTON Public BuyBot starting...")
+    # If you accidentally deploy 2 instances, Telegram will throw Conflict (two getUpdates loops).
+    # We retry instead of crashing the container.
     while True:
         try:
-            application.run_polling(close_loop=False)
+            application.run_polling(close_loop=False, drop_pending_updates=True)
             break
         except Conflict as e:
-            log.error("Telegram Conflict (another instance running). Waiting 5s and retrying... %s", e)
+            log.error("Telegram polling Conflict (another instance running). Stop the other instance, then this will recover. %s", e)
             time.sleep(5)
-            continue
 
 if __name__ == "__main__":
     main()
+

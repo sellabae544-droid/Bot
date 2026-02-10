@@ -831,6 +831,18 @@ def _normalize_tx_hash_to_hex(h: Any) -> str:
     s = str(h).strip()
     if not s:
         return ""
+
+    # If a full URL was provided, try to extract a 64-hex hash from it.
+    # Examples:
+    #   https://tonviewer.com/transaction/<64hex>
+    #   https://tonviewer.com/transaction/<64hex>?...
+    #   https://tonviewer.com/tx/<64hex>
+    try:
+        m = re.search(r"([0-9a-fA-F]{64})", s)
+        if m:
+            return m.group(1).lower()
+    except Exception:
+        pass
     # Already hex?
     if re.fullmatch(r"[0-9a-fA-F]{64}", s):
         return s.lower()
@@ -2164,6 +2176,20 @@ async def poll_once(app: Application):
 
                 ignore_before = int(token.get("ignore_before_ts") or 0)
 
+                # If DeDust was enabled later (or group was created before we stored baselines),
+                # set a baseline FIRST and do not post historical trades on the first run.
+                if (last_lt == 0 and last_ts == 0) and items2:
+                    max_lt = max(i[0] for i in items2)
+                    max_ts = max(i[1] for i in items2)
+                    if max_lt:
+                        token["last_dedust_trade"] = str(max_lt)
+                    if max_ts:
+                        token["last_dedust_ts"] = int(max_ts)
+                    if not ignore_before:
+                        token["ignore_before_ts"] = int(time.time())
+                    save_groups()
+                    continue
+
                 max_seen_lt = last_lt
                 max_seen_ts = last_ts
 
@@ -2286,17 +2312,18 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                 except Exception:
                     pass
 
-    # Holders (best-effort via TonAPI)
     # Holders (keep last known value if APIs fail)
-    prev_holders = None
+    holders = None
     try:
-        prev_holders = _cached.get("holders")
+        if token.get("holders") is not None:
+            holders = int(token.get("holders"))
     except Exception:
-        prev_holders = None
+        holders = None
 
-    holders = prev_holders
     jetton_addr = str(token.get("address") or "").strip()
     if jetton_addr:
+        # TonAPI Jetton info sometimes includes holders_count. If not, fall back
+        # to the dedicated holders endpoint.
         try:
             info = tonapi_jetton_info(jetton_addr)
             h = info.get("holders_count")
@@ -2311,6 +2338,13 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                     holders = int(h2)
             except Exception:
                 pass
+
+    # Persist latest known holders so the field doesn't disappear in later buys.
+    if holders is not None:
+        try:
+            token["holders"] = int(holders)
+        except Exception:
+            pass
 
     # Store/refresh cache so later messages don't lose stats
     if market_cache_key:

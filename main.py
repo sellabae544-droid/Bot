@@ -2161,13 +2161,9 @@ async def poll_once(app: Application):
             except Exception:
                 pass
 
-        if (not orig_sym and (info.get("symbol") or "").strip()):
-            meta_changed = True
-        if (not orig_name and (info.get("name") or "").strip()):
-            meta_changed = True
-            token["init_done"] = True
-            save_groups()
-            continue
+        token["init_done"] = True
+        save_groups()
+        continue
 
         min_buy = float(min_buy_ton_threshold(settings))
         anti = (settings.get("anti_spam") or "MED").upper()

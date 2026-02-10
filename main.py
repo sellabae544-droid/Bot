@@ -3242,10 +3242,6 @@ async def channel_poll_once(app: Application):
             except Exception:
                 pass
 
-        if (not orig_sym and (info.get("symbol") or "").strip()):
-            meta_changed = True
-        if (not orig_name and (info.get("name") or "").strip()):
-            meta_changed = True
 
         # DeDust trades
         if token.get("dedust_pool"):
@@ -3318,10 +3314,6 @@ async def channel_poll_once(app: Application):
             except Exception:
                 pass
 
-        if (not orig_sym and (info.get("symbol") or "").strip()):
-            meta_changed = True
-        if (not orig_name and (info.get("name") or "").strip()):
-            meta_changed = True
 
     # persist SEEN periodically
     try:
@@ -3415,8 +3407,6 @@ def main():
     log.info("SpyTON Public BuyBot starting...")
     application.run_polling(close_loop=False)
 
-if __name__ == "__main__":
-    main()
 # -------------------- STON API (exported events) --------------------
 STON_BASE = os.getenv("STON_BASE", "https://api.ston.fi").rstrip("/")
 STON_LATEST_BLOCK_URL = f"{STON_BASE}/export/dexscreener/v1/latest-block"
@@ -3487,3 +3477,6 @@ def ensure_ton_leg_for_pool(token: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+
+if __name__ == "__main__":
+    main()

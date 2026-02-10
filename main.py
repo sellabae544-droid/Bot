@@ -2079,10 +2079,7 @@ async def poll_once(app: Application):
                     if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
                         continue
                     burst["count"] += 1
-                    try:
-                        await post_buy(app, chat_id, token, {"tx": tx, "buyer": maker, "ton": ton_spent, "token_amount": token_received}, source="STON.fi")
-                    except Exception as _e:
-                        log.warning("post_buy failed chat=%s source=STON.fi err=%s", chat_id, _e)
+                    await post_buy(app, chat_id, token, {"tx": tx, "buyer": maker, "ton": ton_spent, "token_amount": token_received}, source="STON.fi")
                     posted_any = True
 
                 # Fallback for STON.fi v2 swaps (TonAPI tx actions).
@@ -2124,11 +2121,8 @@ async def poll_once(app: Application):
                                     continue
                                 if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
                                     continue
-                                    burst["count"] += 1
-                                    try:
-                                        await post_buy(app, chat_id, token, {"tx": txh, "buyer": buyer, "ton": ton_spent, "token_amount": token_amt}, source="STON.fi v2")
-                                    except Exception as _e:
-                                        log.warning("post_buy failed chat=%s source=STON.fi v2 err=%s", chat_id, _e)
+                                burst["count"] += 1
+                                await post_buy(app, chat_id, token, {"tx": txh, "buyer": buyer, "ton": ton_spent, "token_amount": token_amt}, source="STON.fi v2")
                         save_groups()
                     except Exception as _e:
                         log.debug("STON v2 fallback err chat=%s %s", chat_id, _e)
@@ -2232,16 +2226,13 @@ async def poll_once(app: Application):
                     burst["count"] += 1
 
                     token_amt = float(b.get("token_amount") or 0.0)
-                    try:
-                        await post_buy(app, chat_id, token, {
+                    await post_buy(app, chat_id, token, {
                         "tx": b.get("tx"),
                         "trade_id": str(lt_i or b.get("trade_id") or ""),
                         "buyer": b.get("buyer"),
                         "ton": ton_amt,
                         "token_amount": token_amt,
-                        }, source="DeDust")
-                    except Exception as _e:
-                        log.warning("post_buy failed chat=%s source=DeDust err=%s", chat_id, _e)
+                    }, source="DeDust")
 
                     if lt_i and lt_i > max_seen_lt:
                         max_seen_lt = lt_i
@@ -2281,13 +2272,10 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     dedust_pool = token.get("dedust_pool") or ""
     pool_for_market = ston_pool or dedust_pool
 
-    # Jetton master address (used for token-level fallbacks)
-    jetton_addr = str(token.get("address") or "").strip()
-
     # Market data (prefer GeckoTerminal)
     price_usd = liq_usd = mc_usd = None
     # Try cache first to avoid missing stats (rate limits / temporary failures)
-    market_cache_key = str(pool_for_market or jetton_addr or "").strip()
+    market_cache_key = str(pool_for_market or token_addr or "").strip()
     _mcached = MARKET_CACHE.get(market_cache_key) if market_cache_key else None
     _now = int(time.time())
     if _mcached and _now - int(_mcached.get("ts") or 0) < 900:
@@ -2332,6 +2320,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     except Exception:
         holders = None
 
+    jetton_addr = str(token.get("address") or "").strip()
     if jetton_addr:
         # TonAPI Jetton info sometimes includes holders_count. If not, fall back
         # to the dedicated holders endpoint.

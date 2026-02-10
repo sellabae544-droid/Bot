@@ -12,7 +12,6 @@ from telegram.ext import (
     MessageHandler, ChatMemberHandler, ContextTypes, filters
 )
 
-from datetime import datetime, timezone
 # -------------------- LOGGING --------------------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -193,8 +192,6 @@ def dedust_trade_to_buy(tr: Dict[str, Any], token_addr: str) -> Optional[Dict[st
         "ton": ton_amt,
         "token_amount": token_amt,
         "trade_id": trade_id,
-        "timestamp": ts,
-        "lt": lt,
     }
 
 # -------------------- STATE --------------------
@@ -353,6 +350,7 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
             # Some DeDust endpoints may return trades in oldest->newest order.
             # To prevent "old buys" spam, we always baseline to the MAX lt/trade_id we can see.
             max_lt_i = None
+            max_ts_i = None
             for t in trades:
                 lt_raw = (t.get('lt') or t.get('trade_id') or t.get('id') or '')
                 lt_s = str(lt_raw).strip()
@@ -364,12 +362,24 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
                     except Exception:
                         pass
 
+                # timestamp baseline (ms or sec)
+                ts_raw = (t.get('timestamp') or t.get('time') or t.get('ts') or 0)
+                try:
+                    ts_i = int(float(ts_raw or 0))
+                    if ts_i > 10_000_000_000:  # ms
+                        ts_i = ts_i // 1000
+                    if ts_i > 0 and ((max_ts_i is None) or (ts_i > max_ts_i)):
+                        max_ts_i = ts_i
+                except Exception:
+                    pass
+
                 txhash = (t.get('tx_hash') or t.get('txHash') or t.get('hash') or '').strip()
                 if txhash:
                     bucket[f"dedust:{dedust_pool}:{txhash}"] = int(time.time())
 
             if max_lt_i is not None:
                 newest_dedust = str(max_lt_i)
+            newest_dedust_ts = max_ts_i
 
         # save baselines into group token so polling skips older history
         g = GROUPS.get(str(chat_id)) or {}
@@ -379,6 +389,9 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
                 tok["last_ston_tx"] = newest_ston
             if newest_dedust:
                 tok["last_dedust_trade"] = newest_dedust
+            if newest_dedust_ts:
+                tok["last_dedust_ts"] = int(newest_dedust_ts)
+
             # baseline: ignore anything before now
             tok["ignore_before_ts"] = int(time.time())
             # baseline for STON export cursor: start from current latest block
@@ -944,10 +957,15 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     group_id = None
                 if group_id:
-                    # Auto-detect best DEX (STON.fi / DeDust) then start tracking.
-                    AWAITING[update.effective_user.id] = {"group_id": group_id, "stage": "CA", "dex": "auto"}
+                    # Auto-detect mode: user sends CA, we resolve STON.fi + DeDust pools automatically.
+                    AWAITING[update.effective_user.id] = {"group_id": group_id, "stage": "CA", "dex": "both"}
                     await update.message.reply_text(
-                        "✅ SpyTON BuyBot connected\n\nSend your token CA here. I will auto-detect the best DEX (STON.fi / DeDust) and start tracking.",
+                        "✅ *SpyTON BuyBot connected*\n\n"
+                        "Now send the token CA here in DM.\n"
+                        "I will auto-detect *STON.fi* / *DeDust* pools and start posting buys in your group.\n\n"
+                        "Tip: you can also include the token Telegram link in the same message.\n"
+                        "Example:\n`<CA> https://t.me/YourToken`",
+                        parse_mode="Markdown"
                     )
                     return
         add_url = await build_add_to_group_url(context.application)
@@ -1817,54 +1835,30 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         name = (dx.get("name") or "").strip()
         sym = (dx.get("symbol") or "").strip()
     dex_mode = (dex_mode or "both").lower().strip()
-    ston_pool = find_stonfi_ton_pair_for_token(jetton) if dex_mode in ("both","auto","best","ston","stonfi") else None
-    dedust_pool = find_dedust_ton_pair_for_token(jetton) if dex_mode in ("both","auto","best","dedust") else None
-
-    best_dex = None
-    # Auto mode: resolve both pools (if possible) and pick the best one to track by default
-    if dex_mode in ("auto","best"):
-        ston_score = 0.0
-        dedust_score = 0.0
-        if ston_pool:
-            p = _dex_pair_lookup(ston_pool) or {}
-            ston_score = float((p.get("liquidity") or {}).get("usd") or 0) + float((p.get("volume") or {}).get("h24") or 0) * 0.1
-        if dedust_pool:
-            p = _dex_pair_lookup(dedust_pool) or {}
-            dedust_score = float((p.get("liquidity") or {}).get("usd") or 0) + float((p.get("volume") or {}).get("h24") or 0) * 0.1
-        if ston_score <= 0 and ston_pool and not dedust_pool:
-            best_dex = "stonfi"
-        elif dedust_score <= 0 and dedust_pool and not ston_pool:
-            best_dex = "dedust"
-        else:
-            if ston_score >= dedust_score and ston_pool:
-                best_dex = "stonfi"
-            elif dedust_pool:
-                best_dex = "dedust"
-        # enable only the selected dex by default (user can still enable both later if desired)
-        settings["enable_stonfi"] = bool(ston_pool) and best_dex == "stonfi"
-        settings["enable_dedust"] = bool(dedust_pool) and best_dex == "dedust"
-        settings["dex_mode"] = "auto_best"
-    else:
-        settings["enable_stonfi"] = bool(ston_pool) and dex_mode in ("both","ston","stonfi")
-        settings["enable_dedust"] = bool(dedust_pool) and dex_mode in ("both","dedust")
+    ston_pool = find_stonfi_ton_pair_for_token(jetton) if dex_mode in ("both","ston","stonfi") else None
+    dedust_pool = find_dedust_ton_pair_for_token(jetton) if dex_mode in ("both","dedust") else None
 
     g = get_group(chat_id)
-    # Auto-enable only the selected DEX (Crypton-style). You can enable the other DEX later in Token Settings.
+    # Auto-enable pools we actually found.
+    # In auto/both mode we keep both enabled if pools exist (no manual DEX split required).
     try:
         s = g.get("settings") or {}
-        if dex_mode in ("ston","stonfi"):
+        if dex_mode in ("ston", "stonfi"):
             s["enable_ston"] = True
             s["enable_dedust"] = False
         elif dex_mode in ("dedust",):
             s["enable_ston"] = False
             s["enable_dedust"] = True
+        else:
+            s["enable_ston"] = bool(ston_pool)
+            s["enable_dedust"] = bool(dedust_pool)
         g["settings"] = s
     except Exception:
         pass
 
     g["token"] = {
         "address": jetton,
-        "dex_mode": dex_mode,
+        "dex_mode": ("auto" if dex_mode=="both" else dex_mode),
         "name": name,
         "symbol": sym,
         "ston_pool": ston_pool,
@@ -1883,6 +1877,14 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
 
     # Prevent posting old buys right after configuration
     await warmup_seen_for_chat(chat_id, ston_pool, dedust_pool)
+    # Mark init done so tracker loop doesn't skip another full cycle
+    try:
+        g2 = get_group(chat_id)
+        if isinstance(g2.get('token'), dict):
+            g2['token']['init_done'] = True
+            save_groups()
+    except Exception:
+        pass
 
     disp = sym or name or "TOKEN"
     msg = (
@@ -2075,57 +2077,107 @@ async def poll_once(app: Application):
         if settings.get("enable_dedust", True) and token.get("dedust_pool"):
             pool = token["dedust_pool"]
             try:
-                trades = await _to_thread(dedust_get_trades, pool, 25)
-                # process oldest -> newest
-                trades = list(reversed(trades))
-                last_id = str(token.get('last_dedust_trade') or '').strip()
+                trades = await _to_thread(dedust_get_trades, pool, 40)
+                if not isinstance(trades, list):
+                    trades = []
+                # Build sortable items with (lt, ts) so ordering is stable regardless of API order.
+                items2 = []
                 for tr in trades:
                     b = dedust_trade_to_buy(tr, token["address"])
                     if not b:
                         continue
-                    # Ignore old history right after token added
-                    ignore_before = int(token.get("ignore_before_ts") or 0)
-                    tr_ts = int(tr.get("timestamp") or tr.get("time") or tr.get("ts") or 0)
-                    if ignore_before and tr_ts and tr_ts < ignore_before:
+                    # normalize timestamp (ms or sec)
+                    ts_raw = (tr.get("timestamp") or tr.get("time") or tr.get("ts") or 0)
+                    try:
+                        ts_i = int(float(ts_raw or 0))
+                        if ts_i > 10_000_000_000:
+                            ts_i = ts_i // 1000
+                    except Exception:
+                        ts_i = 0
+                    # lt/trade_id (prefer numeric)
+                    lt_raw = (tr.get("lt") or b.get("trade_id") or tr.get("id") or "")
+                    try:
+                        lt_i = int(str(lt_raw).strip()) if str(lt_raw).strip() else 0
+                    except Exception:
+                        lt_i = 0
+                    items2.append((lt_i, ts_i, b, tr))
+
+                # sort oldest -> newest
+                items2.sort(key=lambda x: (x[0] or 0, x[1] or 0))
+
+                # baselines
+                last_lt = 0
+                last_ts = 0
+                try:
+                    last_lt = int(str(token.get("last_dedust_trade") or 0))
+                except Exception:
+                    last_lt = 0
+                try:
+                    last_ts = int(token.get("last_dedust_ts") or 0)
+                except Exception:
+                    last_ts = 0
+
+                ignore_before = int(token.get("ignore_before_ts") or 0)
+
+                max_seen_lt = last_lt
+                max_seen_ts = last_ts
+
+                for lt_i, ts_i, b, tr in items2:
+                    # ignore old history right after token added
+                    if ignore_before and ts_i and ts_i < ignore_before:
                         continue
-                    # Prefer DeDust LT for ordering (most reliable)
-                    lt = str(tr.get('lt') or b.get('trade_id') or '').strip()
-                    if last_id and lt:
-                        try:
-                            if int(lt) <= int(last_id):
-                                continue
-                        except Exception:
-                            pass
+
+                    is_new = False
+                    if lt_i and last_lt:
+                        is_new = lt_i > last_lt
+                    elif lt_i and not last_lt:
+                        # If we have lt but no baseline yet, treat as new only if after ignore_before
+                        is_new = True
+                    elif ts_i and last_ts:
+                        is_new = ts_i > last_ts
+                    elif ts_i and not last_ts:
+                        is_new = True
+
+                    if not is_new:
+                        continue
+
                     ton_amt = float(b.get("ton") or 0.0)
                     if ton_amt < min_buy:
                         continue
-                    dedupe_key = f"dedust:{pool}:{b.get('tx')}"
+
+                    # unified dedupe by normalized tx hash when possible
+                    txh = _normalize_tx_hash_to_hex(b.get("tx") or "")
+                    dedupe_key = f"tx:{txh}" if txh else f"dedust:{pool}:{b.get('tx')}"
                     if not dedupe_ok(chat_id, dedupe_key):
                         continue
                     if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
                         continue
                     burst["count"] += 1
-                    token_amt = float(b.get("token_amount") or 0.0)
-                    dec = token.get("decimals")
-                    try:
-                        dec_i = int(dec) if dec is not None else None
-                    except Exception:
-                        dec_i = None
-                    if dec_i is not None and token_amt > 1e8:
-                        token_amt = token_amt / (10 ** dec_i)
 
+                    token_amt = float(b.get("token_amount") or 0.0)
                     await post_buy(app, chat_id, token, {
                         "tx": b.get("tx"),
-                        "trade_id": lt,
+                        "trade_id": str(lt_i or b.get("trade_id") or ""),
                         "buyer": b.get("buyer"),
                         "ton": ton_amt,
                         "token_amount": token_amt,
                     }, source="DeDust")
-                    token["last_dedust_trade"] = lt or token.get("last_dedust_trade")
+
+                    if lt_i and lt_i > max_seen_lt:
+                        max_seen_lt = lt_i
+                    if ts_i and ts_i > max_seen_ts:
+                        max_seen_ts = ts_i
+
+                # update baselines
+                if max_seen_lt:
+                    token["last_dedust_trade"] = str(max_seen_lt)
+                if max_seen_ts:
+                    token["last_dedust_ts"] = int(max_seen_ts)
 
                 save_groups()
             except Exception as e:
                 log.debug("DeDust poll err chat=%s %s", chat_id, e)
+
 
 
     # save seen occasionally
@@ -2496,3 +2548,5 @@ def ensure_ton_leg_for_pool(token: Dict[str, Any]) -> Optional[int]:
         token["ton_leg"] = 1
         return 1
     return None
+
+

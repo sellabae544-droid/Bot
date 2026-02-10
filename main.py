@@ -25,7 +25,6 @@ TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
 TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io").strip().rstrip("/")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "6.0"))
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
-RESTART_WARMUP_GAP_SEC = int(os.getenv("RESTART_WARMUP_GAP_SEC", "120"))
 DTRADE_REF = os.getenv("DTRADE_REF", "https://t.me/dtrade?start=11TYq7LInG").strip()
 TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/SpyTonTrending").strip()
 DEFAULT_TOKEN_TG = os.getenv("DEFAULT_TOKEN_TG", "https://t.me/SpyTonEco").strip()
@@ -428,8 +427,8 @@ def anti_spam_limit(level: str) -> Tuple[int,int]:
     if lvl == "LOW":
         return (9999, BURST_WINDOW_SEC)
     if lvl == "HIGH":
-        return (10, BURST_WINDOW_SEC)
-    return (20, BURST_WINDOW_SEC)
+        return (4, BURST_WINDOW_SEC)
+    return (8, BURST_WINDOW_SEC)
 
 # -------------------- TONAPI --------------------
 def tonapi_headers() -> Dict[str, str]:
@@ -439,28 +438,13 @@ def tonapi_headers() -> Dict[str, str]:
 
 def tonapi_get_raw(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
     try:
-        # Basic retries for 429 / transient issues
-        for attempt in range(3):
-            res = requests.get(url, headers=tonapi_headers(), params=params, timeout=20)
-            if res.status_code in (401, 403) and TONAPI_KEY:
-                # sometimes user sets X-API-Key (toncenter-style)
-                res = requests.get(url, headers={"X-API-Key": TONAPI_KEY, "Accept": "application/json"}, params=params, timeout=20)
-
-            if res.status_code == 429:
-                try:
-                    time.sleep(0.4 * (attempt + 1))
-                except Exception:
-                    pass
-                continue
-
-            if res.status_code != 200:
-                return None
-
-            try:
-                return res.json()
-            except Exception:
-                return None
-        return None
+        res = requests.get(url, headers=tonapi_headers(), params=params, timeout=20)
+        if res.status_code in (401,403) and TONAPI_KEY:
+            # sometimes user sets X-API-Key (toncenter-style)
+            res = requests.get(url, headers={"X-API-Key": TONAPI_KEY, "Accept":"application/json"}, params=params, timeout=20)
+        if res.status_code != 200:
+            return None
+        return res.json()
     except Exception:
         return None
 
@@ -476,8 +460,6 @@ def tonapi_jetton_info(jetton: str) -> Dict[str, Any]:
     """
     out: Dict[str, Any] = {"name": "", "symbol": "", "holders_count": None}
     js = tonapi_get(f"{TONAPI_BASE}/v2/jettons/{jetton}")
-    if not js and TONAPI_BASE != "https://tonapi.io":
-        js = tonapi_get(f"https://tonapi.io/v2/jettons/{jetton}")
     if not js:
         return out
     meta = js.get("metadata") or {}
@@ -496,8 +478,6 @@ def tonapi_jetton_holders_count(jetton: str) -> Optional[int]:
     """Best-effort holders count. Some TonAPI responses don't include holders_count on the main jetton endpoint."""
     try:
         data = tonapi_get(f"{TONAPI_BASE}/v2/jettons/{jetton}/holders", params={"limit": 1, "offset": 0})
-        if not data and TONAPI_BASE != "https://tonapi.io":
-            data = tonapi_get(f"https://tonapi.io/v2/jettons/{jetton}/holders", params={"limit": 1, "offset": 0})
         if not isinstance(data, dict):
             return None
         # TonAPI may return total/total_count in root
@@ -2024,23 +2004,6 @@ async def poll_once(app: Application):
             save_groups()
             continue
 
-        # Restart-gap warmup: if the bot was offline for a while, avoid backfilling old swaps.
-        now = int(time.time())
-        try:
-            last_poll = int(token.get("last_poll_ts") or 0)
-        except Exception:
-            last_poll = 0
-        gap = (now - last_poll) if last_poll else 0
-        token["last_poll_ts"] = now
-        if gap and gap > RESTART_WARMUP_GAP_SEC:
-            try:
-                await warmup_seen_for_chat(chat_id, token.get("ston_pool"), token.get("dedust_pool"))
-                token["ignore_before_ts"] = int(time.time())
-                save_groups()
-            except Exception:
-                pass
-            continue
-
         min_buy = float(min_buy_ton_threshold(settings))
         anti = (settings.get("anti_spam") or "MED").upper()
         max_msgs, window = anti_spam_limit(anti)
@@ -2065,17 +2028,10 @@ async def poll_once(app: Application):
                     last_block = max(0, int(latest) - 5)
                 from_b = int(last_block) + 1
                 to_b = int(latest)
-                # Fetch in chunks so we don't miss swaps if the cursor lags behind.
-                max_span = 60
-                all_evs: List[Dict[str, Any]] = []
-                start_b = from_b
-                while start_b <= to_b:
-                    end_b = min(start_b + max_span - 1, to_b)
-                    evs_part = await _to_thread(ston_events, start_b, end_b)
-                    if isinstance(evs_part, list) and evs_part:
-                        all_evs.extend(evs_part)
-                    start_b = end_b + 1
-                evs = all_evs
+                # cap range to avoid huge pulls
+                if to_b - from_b > 60:
+                    from_b = to_b - 60
+                evs = await _to_thread(ston_events, from_b, to_b)
                 # advance cursor even if no events
                 token["ston_last_block"] = to_b
                 # filter swaps for this pool (STON export feed)
@@ -2316,8 +2272,6 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     dedust_pool = token.get("dedust_pool") or ""
     pool_for_market = ston_pool or dedust_pool
 
-    token_addr = str(token.get("address") or "").strip()
-
     # Market data (prefer GeckoTerminal)
     price_usd = liq_usd = mc_usd = None
     # Try cache first to avoid missing stats (rate limits / temporary failures)
@@ -2325,12 +2279,6 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     _mcached = MARKET_CACHE.get(market_cache_key) if market_cache_key else None
     _now = int(time.time())
     if _mcached and _now - int(_mcached.get("ts") or 0) < 900:
-        _ch = _mcached.get("holders")
-        if _ch is not None:
-            try:
-                token.setdefault("holders", int(_ch))
-            except Exception:
-                pass
         price_usd = _mcached.get("price_usd")
         liq_usd = _mcached.get("liq_usd")
         mc_usd = _mcached.get("mc_usd")
@@ -2625,8 +2573,6 @@ def main():
     log.info("SpyTON Public BuyBot starting...")
     application.run_polling(close_loop=False)
 
-if __name__ == "__main__":
-    main()
 # -------------------- STON API (exported events) --------------------
 STON_BASE = os.getenv("STON_BASE", "https://api.ston.fi").rstrip("/")
 STON_LATEST_BLOCK_URL = f"{STON_BASE}/export/dexscreener/v1/latest-block"
@@ -2696,4 +2642,5 @@ def ensure_ton_leg_for_pool(token: Dict[str, Any]) -> Optional[int]:
         return 1
     return None
 
-
+if __name__ == '__main__':
+    main()

@@ -3,7 +3,6 @@ import os, json, time, asyncio, logging, re, html, base64
 from typing import Any, Dict, Optional, List, Tuple
 from urllib.parse import urlparse, quote
 import requests
-import fcntl
 
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
@@ -21,33 +20,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("spyton_public")
 
-# -------------------- SINGLETON LOCK --------------------
-_LOCK_FH = None
-
-def acquire_singleton_lock() -> None:
-    """Prevent accidental double-running in the same container.
-
-    This avoids Telegram getUpdates 'Conflict' when a platform starts two
-    processes from the same service image (e.g., web + worker).
-    """
-    global _LOCK_FH
-    lock_path = os.getenv("BOT_LOCK_FILE", "/tmp/spyton_buybot.lock")
-    _LOCK_FH = open(lock_path, "w")
-    try:
-        fcntl.flock(_LOCK_FH.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _LOCK_FH.write(str(os.getpid()))
-        _LOCK_FH.flush()
-    except BlockingIOError:
-        raise SystemExit(
-            "Another SpyTON bot process is already running in this container. "
-            "Stop the duplicate instance or set RUN_BOT=0 on the extra process."
-        )
-
 # -------------------- ENV --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
 TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io").strip().rstrip("/")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "6.0"))
+TRACKER_ONLY = os.getenv("TRACKER_ONLY", "0").strip() in ("1", "true", "TRUE", "yes", "YES")
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 DTRADE_REF = os.getenv("DTRADE_REF", "https://t.me/dtrade?start=11TYq7LInG").strip()
 TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/SpyTonTrending").strip()
@@ -223,7 +201,8 @@ DEFAULT_SETTINGS = {
     "enable_ston": True,
     "enable_dedust": True,
     "min_buy_ton": 0.0,
-    "anti_spam": "MED",   # LOW | MED | HIGH
+    # LOW = do not rate-limit buy posts (no skipping). Users can lower this later.
+    "anti_spam": "LOW",   # LOW | MED | HIGH
     "burst_mode": True,
 
     # Crypton-style options
@@ -2178,7 +2157,8 @@ async def poll_once(app: Application):
                 # but TonAPI actions still include "Swap tokens" / "Stonfi Swap V2".
                 if not posted_any:
                     try:
-                        txs = await _to_thread(tonapi_account_transactions, pool, 15)
+                        # Use a larger window so we don't miss swaps on busy pools.
+                        txs = await _to_thread(tonapi_account_transactions, pool, 120)
                         # process oldest -> newest
                         txs = list(reversed(txs))
                         for txo in txs:
@@ -2647,24 +2627,25 @@ async def post_init(app: Application):
     app.create_task(tracker_loop(app))
     log.info("Tracker started.")
 
+
+async def _run_tracker_only(application: Application):
+    """Run only the tracker loop (no getUpdates polling).
+
+    This avoids Telegram Conflict errors when multiple instances accidentally run.
+    The bot can still SEND messages (post buys), but interactive commands/buttons
+    won't work until polling/webhook is enabled again.
+    """
+    await application.initialize()
+    await application.start()
+    # post_init isn't called automatically unless we use run_polling/run_webhook
+    await post_init(application)
+    log.warning("Running in TRACKER_ONLY=1 mode (no polling).")
+    while True:
+        await asyncio.sleep(3600)
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is missing.")
-
-    # Prevent a duplicated start inside the same container.
-    acquire_singleton_lock()
-
-    # Safety guard: if the platform accidentally starts two processes
-    # (e.g., a "web" and a "worker"), you can disable polling for one of them.
-    # Set RUN_BOT=0 on the extra process.
-    if os.getenv("RUN_BOT", "1").strip() in ("0", "false", "False", "no", "NO"):
-        import threading
-        threading.Thread(target=run_flask, daemon=True).start()
-        log.warning("RUN_BOT=0 -> health server only; polling disabled.")
-        import time
-        while True:
-            time.sleep(3600)
-
     application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", start_cmd))
@@ -2679,16 +2660,22 @@ def main():
     threading.Thread(target=run_flask, daemon=True).start()
 
     log.info("SpyTON Public BuyBot starting...")
-    # If Telegram detects another getUpdates consumer, it raises Conflict.
-    # Instead of crashing the container immediately, we retry a few times.
+
+    # If you only want the bot to post buys (and avoid getUpdates conflicts),
+    # set TRACKER_ONLY=1 in Railway environment variables.
+    if TRACKER_ONLY:
+        asyncio.run(_run_tracker_only(application))
+        return
+
+    # Normal mode: run polling with automatic retry on Telegram Conflict.
+    # Conflict happens when two instances use the same bot token.
     while True:
         try:
-            application.run_polling(close_loop=False)
+            application.run_polling(close_loop=False, drop_pending_updates=True)
             break
         except Conflict as e:
-            log.error("Telegram getUpdates conflict: %s", e)
-            time.sleep(15)
-            continue
+            log.error("Telegram Conflict (another instance is running). Retrying in 6s... %s", e)
+            time.sleep(6)
 
 # -------------------- STON API (exported events) --------------------
 STON_BASE = os.getenv("STON_BASE", "https://api.ston.fi").rstrip("/")

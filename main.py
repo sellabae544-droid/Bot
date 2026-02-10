@@ -530,17 +530,45 @@ def tonapi_headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {TONAPI_KEY}", "Accept": "application/json"}
 
 def tonapi_get_raw(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
-    try:
-        res = requests.get(url, headers=tonapi_headers(), params=params, timeout=20)
-        if res.status_code in (401,403) and TONAPI_KEY:
-            # sometimes user sets X-API-Key (toncenter-style)
-            res = requests.get(url, headers={"X-API-Key": TONAPI_KEY, "Accept":"application/json"}, params=params, timeout=20)
-        if res.status_code != 200:
-            return None
-        return res.json()
-    except Exception:
-        return None
+    """HTTP GET helper for TonAPI with light retry/backoff.
 
+    Without a TONAPI key, TonAPI can rate-limit (429). We retry a few times and
+    fall back to the last known holders value in the caller if still unavailable.
+    """
+    headers = tonapi_headers()
+    # retry on 429 / transient 5xx
+    for attempt in range(4):
+        try:
+            res = requests.get(url, headers=headers, params=params, timeout=20)
+            # If the user provided a key but used the wrong header scheme, try X-API-Key once.
+            if res.status_code in (401, 403) and TONAPI_KEY:
+                res = requests.get(
+                    url,
+                    headers={"X-API-Key": TONAPI_KEY, "Accept": "application/json"},
+                    params=params,
+                    timeout=20,
+                )
+
+            if res.status_code == 200:
+                return res.json()
+
+            # rate limit or temporary server issues: backoff and retry
+            if res.status_code in (429, 500, 502, 503, 504):
+                try:
+                    time.sleep(0.45 * (2 ** attempt))
+                except Exception:
+                    pass
+                continue
+
+            return None
+        except Exception:
+            # transient network errors
+            try:
+                time.sleep(0.25 * (2 ** attempt))
+            except Exception:
+                pass
+            continue
+    return None
 def tonapi_get(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     js = tonapi_get_raw(url, params=params)
     return js if isinstance(js, dict) else None
@@ -558,11 +586,18 @@ def tonapi_jetton_info(jetton: str) -> Dict[str, Any]:
     meta = js.get("metadata") or {}
     out["name"] = str(meta.get("name") or js.get("name") or "").strip()
     out["symbol"] = str(meta.get("symbol") or js.get("symbol") or "").strip()
-    # TonAPI commonly exposes holders_count at top-level
+    # TonAPI commonly exposes holders_count at top-level (naming varies)
     try:
-        hc = js.get("holders_count")
-        if hc is not None:
-            out["holders_count"] = int(hc)
+        for k in ("holders_count", "holders", "holdersCount", "total_holders", "holders_total"):
+            hc = js.get(k)
+            if hc is None:
+                continue
+            if isinstance(hc, int):
+                out["holders_count"] = int(hc)
+                break
+            if isinstance(hc, str) and hc.isdigit():
+                out["holders_count"] = int(hc)
+                break
     except Exception:
         pass
     return out
@@ -1985,6 +2020,22 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         name = (dx.get("name") or "").strip()
         sym = (dx.get("symbol") or "").strip()
     dex_mode = (dex_mode or "both").lower().strip()
+    # Seed holders once at setup so first buys show holders immediately.
+    holders_seed: Optional[int] = None
+    try:
+        info_h = tonapi_jetton_info(jetton)
+        hh = info_h.get("holders_count")
+        if hh is not None:
+            holders_seed = int(hh)
+    except Exception:
+        pass
+    if holders_seed is None:
+        try:
+            hh2 = tonapi_jetton_holders_count(jetton)
+            if hh2 is not None:
+                holders_seed = int(hh2)
+        except Exception:
+            pass
     ston_pool = find_stonfi_ton_pair_for_token(jetton) if dex_mode in ("both","ston","stonfi") else None
     dedust_pool = find_dedust_ton_pair_for_token(jetton) if dex_mode in ("both","dedust") else None
 
@@ -2011,6 +2062,7 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "dex_mode": ("auto" if dex_mode=="both" else dex_mode),
         "name": name,
         "symbol": sym,
+        "holders": holders_seed,
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
         "set_at": int(time.time()),
@@ -2678,4 +2730,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

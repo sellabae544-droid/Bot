@@ -23,8 +23,7 @@ log = logging.getLogger("spyton_public")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
 TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io").strip().rstrip("/")
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "3.0"))  # default faster; override via env
-WELCOME_COOLDOWN = int(os.getenv("WELCOME_COOLDOWN", "120"))  # seconds
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "6.0"))
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 DTRADE_REF = os.getenv("DTRADE_REF", "https://t.me/dtrade?start=11TYq7LInG").strip()
 TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/SpyTonTrending").strip()
@@ -276,7 +275,6 @@ def get_group(chat_id: int) -> Dict[str, Any]:
     g.setdefault("settings", dict(DEFAULT_SETTINGS))
     g.setdefault("token", None)  # {address, symbol, name, ston_pool, dedust_pool}
     g.setdefault("created_at", int(time.time()))
-    g.setdefault("last_welcome_ts", 0)
     return g
 
 def save_groups():
@@ -1001,46 +999,6 @@ async def build_add_to_group_url(app: Application) -> str:
         pass
     return "https://t.me/"  # fallback
 
-
-async def send_group_connected_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int, *, force: bool = False) -> None:
-    """Send the main group menu immediately after the bot is added or promoted."""
-    g = get_group(chat_id)
-    now = int(time.time())
-    last = int(g.get("last_welcome_ts", 0) or 0)
-    if (not force) and (now - last < WELCOME_COOLDOWN):
-        return
-    g["last_welcome_ts"] = now
-    save_groups()
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚙️ Configure Token", callback_data="cfg_start")],
-        [InlineKeyboardButton("⚙️ Token Settings", callback_data="tok_settings_menu")],
-        [InlineKeyboardButton("🛠 Settings", callback_data="settings_menu")],
-        [InlineKeyboardButton("📊 Status", callback_data="status")],
-        [InlineKeyboardButton("🗑 Remove Token", callback_data="remove_token_confirm")],
-    ])
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="✅ SpyTON BuyBot connected\nTap Configure Token to start posting buys.",
-        reply_markup=keyboard,
-    )
-
-
-async def on_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fallback: when the bot is added via 'Add Members', Telegram sends NEW_CHAT_MEMBERS."""
-    if not update.message:
-        return
-    chat = update.effective_chat
-    if not chat or chat.type not in ("group", "supergroup"):
-        return
-
-    me = await context.bot.get_me()
-    for m in update.message.new_chat_members:
-        if m.id == me.id:
-            await send_group_connected_menu(context, chat.id)
-            break
-
-
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not chat:
@@ -1084,7 +1042,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # In group, show group menu
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("⚙️ Configure Token", callback_data="CFG_GROUP")],
-                [InlineKeyboardButton("⚙️ Token Settings", callback_data=TOKENSET_GROUP)],
+            [InlineKeyboardButton("⚙️ Token Settings", callback_data="TOKENSET_GROUP")],
             [InlineKeyboardButton("🛠 Settings", callback_data="SET_GROUP")],
             [InlineKeyboardButton("📊 Status", callback_data="STATUS_GROUP")],
             [InlineKeyboardButton("🗑 Remove Token", callback_data="REMOVE_GROUP")],
@@ -2567,7 +2525,6 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if new and new.status in ("member","administrator"):
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("⚙️ Configure Token", callback_data="CFG_GROUP")],
-                [InlineKeyboardButton("⚙️ Token Settings", callback_data=TOKENSET_GROUP)],
                 [InlineKeyboardButton("🛠 Settings", callback_data="SET_GROUP")],
                 [InlineKeyboardButton("📊 Status", callback_data="STATUS_GROUP")],
             ])
@@ -2608,7 +2565,6 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_chat_members))
 
     # flask in thread for Railway health
     import threading
@@ -2687,3 +2643,5 @@ def ensure_ton_leg_for_pool(token: Dict[str, Any]) -> Optional[int]:
         token["ton_leg"] = 1
         return 1
     return None
+
+

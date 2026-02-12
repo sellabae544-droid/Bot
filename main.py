@@ -2672,8 +2672,10 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if new and new.status in ("member","administrator"):
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("⚙️ Configure Token", callback_data="CFG_GROUP")],
+                [InlineKeyboardButton("⚙️ Token Settings", callback_data="TOKENSET_GROUP")],
                 [InlineKeyboardButton("🛠 Settings", callback_data="SET_GROUP")],
                 [InlineKeyboardButton("📊 Status", callback_data="STATUS_GROUP")],
+                [InlineKeyboardButton("🗑 Remove Token", callback_data="REMOVE_GROUP")],
             ])
             await context.bot.send_message(
                 chat_id=chat.id,

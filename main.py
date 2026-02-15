@@ -301,79 +301,58 @@ def dedust_trade_to_buy(tr: Dict[str, Any], token_addr: str) -> Optional[Dict[st
 
 
 # -------------------- DEDUST (TonAPI events fallback) --------------------
-DEDUST_BUY_OPS = {"0xa5a7cbf8"}  # common DeDust buy opcode seen in TonAPI SmartContractExec.operation
+DEDUST_BUY_OPS = {
+    "0xa5a7cbf8",  # buy
+    "0xcbc33949",  # sell (kept for filtering)
+    "0x5652f1df",  # rewards/other (kept for filtering)
+}
 
-def dedust_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
-    """Extract TON->token buys from a TonAPI event for a given token address.
+def dedust_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str, pool_addr: str) -> List[Dict[str, Any]]:
+    """Extract TON->token buys from a TonAPI *pool* event.
 
-    Used as a fallback when DeDust trade indexing is missing/lagging (common for new/legacy pools).
+    Why this exists:
+    - DeDust "trades" API can lag or be empty for some pools.
+    - TonAPI /events sometimes omits the nice "swap" action; instead you get SmartContractExec + transfers.
+
+    Strategy (best-effort):
+    1) Find JettonTransfer where jetton master == token_addr and recipient is some user => that's the buyer + token_amount.
+    2) Find TON amount spent by that buyer in the same event:
+       - Prefer TonTransfer buyer -> pool_addr.
+       - Else use SmartContractExec.ton_attached if executor == buyer.
     """
     if not isinstance(ev, dict):
         return []
     token_addr = str(token_addr or "").strip()
-    if not token_addr:
+    pool_addr = str(pool_addr or "").strip()
+    if not token_addr or not pool_addr:
         return []
 
     actions = ev.get("actions") or []
     if not isinstance(actions, list):
         return []
 
-    exec_action = None
-    for a in actions:
-        if not isinstance(a, dict):
-            continue
-        if a.get("type") == "SmartContractExec" and isinstance(a.get("SmartContractExec"), dict):
-            sc = a["SmartContractExec"]
-            op = str(sc.get("operation") or sc.get("op") or "").strip().lower()
-            if op and op.startswith("call:"):
-                op = op.replace("call:", "").strip()
-            if (not op) or (op in DEDUST_BUY_OPS):
-                exec_action = sc
-                break
-
-    if not exec_action:
-        for a in actions:
-            if not isinstance(a, dict):
-                continue
-            if a.get("type") == "SmartContractExec" and isinstance(a.get("SmartContractExec"), dict):
-                exec_action = a["SmartContractExec"]
-                break
-
-    if not exec_action:
-        return []
-
-    executor = exec_action.get("executor") or {}
-    user_addr = str((executor.get("address") if isinstance(executor, dict) else "") or "").strip()
-    if not user_addr:
-        return []
-
-    ton_attached = exec_action.get("ton_attached") or exec_action.get("tonAttached") or 0
-    try:
-        ton_amount = float(ton_attached) / 1e9
-    except Exception:
-        ton_amount = 0.0
-    if ton_amount <= 0:
-        return []
-
-    buys: List[Dict[str, Any]] = []
     tx_hash = tonapi_event_tx_hash(ev)
-    event_id = str(ev.get("event_id") or "").strip()
+    event_id = str(ev.get("event_id") or ev.get("id") or "").strip()
+
+    # Collect candidate jetton transfers to users (recipient != pool).
+    candidates: List[Tuple[str, float]] = []  # (buyer_addr, token_amount)
     for a in actions:
-        if not isinstance(a, dict):
-            continue
-        if a.get("type") != "JettonTransfer":
+        if not isinstance(a, dict) or a.get("type") != "JettonTransfer":
             continue
         jt = a.get("JettonTransfer")
         if not isinstance(jt, dict):
             continue
-        recipient = jt.get("recipient") or {}
-        recipient_addr = str((recipient.get("address") if isinstance(recipient, dict) else "") or "").strip()
-        if recipient_addr != user_addr:
-            continue
+
         jetton = jt.get("jetton") or {}
         jetton_addr = str((jetton.get("address") if isinstance(jetton, dict) else "") or "").strip()
         if jetton_addr != token_addr:
             continue
+
+        recipient = jt.get("recipient") or {}
+        buyer_addr = str((recipient.get("address") if isinstance(recipient, dict) else "") or "").strip()
+        if not buyer_addr or buyer_addr == pool_addr:
+            continue
+
         amt_raw = jt.get("amount")
         try:
             dec = int(jetton.get("decimals", 9)) if isinstance(jetton, dict) else 9
@@ -385,9 +364,84 @@ def dedust_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> List[D
             token_amount = 0.0
         if token_amount <= 0:
             continue
+
+        candidates.append((buyer_addr, token_amount))
+
+    if not candidates:
+        return []
+
+    # Map buyer -> TON spent (best-effort).
+    # Prefer explicit TonTransfer buyer -> pool, but some pools route via vault contracts.
+    ton_spent_by: Dict[str, float] = {}
+    outgoing_by: Dict[str, float] = {}
+    for a in actions:
+        if not isinstance(a, dict) or a.get("type") not in ("TonTransfer", "TONTransfer", "Transfer"):
+            continue
+        tt = a.get("TonTransfer") or a.get("TONTransfer") or a.get("Transfer")
+        if not isinstance(tt, dict):
+            continue
+        sender = tt.get("sender") or {}
+        recipient = tt.get("recipient") or {}
+        sender_addr = str((sender.get("address") if isinstance(sender, dict) else "") or "").strip()
+        recip_addr = str((recipient.get("address") if isinstance(recipient, dict) else "") or "").strip()
+        if not sender_addr or not recip_addr or sender_addr == recip_addr:
+            continue
+        amt = tt.get("amount")
+        try:
+            ton_amt = float(amt) / 1e9
+        except Exception:
+            ton_amt = 0.0
+        if ton_amt <= 0:
+            continue
+
+        # Track outgoing TON from sender (fallback when pool routing is indirect)
+        outgoing_by[sender_addr] = max(outgoing_by.get(sender_addr, 0.0), ton_amt)
+
+        # Direct buyer -> pool transfer (best signal)
+        if recip_addr == pool_addr:
+            ton_spent_by[sender_addr] = max(ton_spent_by.get(sender_addr, 0.0), ton_amt)
+
+    # If we didn't find direct transfers to the pool, fall back to the biggest outgoing TON per buyer.
+    if not ton_spent_by and outgoing_by:
+        ton_spent_by = outgoing_by
+
+    # Fallback: SmartContractExec.ton_attached when executor is the buyer
+    if not ton_spent_by:
+        for a in actions:
+            if not isinstance(a, dict) or a.get("type") != "SmartContractExec":
+                continue
+            sc = a.get("SmartContractExec")
+            if not isinstance(sc, dict):
+                continue
+            op = str(sc.get("operation") or sc.get("op") or "").strip().lower()
+            if op.startswith("call:"):
+                op = op.replace("call:", "").strip()
+            # If the opcode is present and is not our known set, skip it.
+            if op and op not in DEDUST_BUY_OPS:
+                continue
+
+            executor = sc.get("executor") or {}
+            ex_addr = str((executor.get("address") if isinstance(executor, dict) else "") or "").strip()
+            if not ex_addr:
+                continue
+
+            ton_attached = sc.get("ton_attached") or sc.get("tonAttached") or 0
+            try:
+                ton_amt = float(ton_attached) / 1e9
+            except Exception:
+                ton_amt = 0.0
+            if ton_amt <= 0:
+                continue
+            ton_spent_by[ex_addr] = max(ton_spent_by.get(ex_addr, 0.0), ton_amt)
+
+    buys: List[Dict[str, Any]] = []
+    for buyer_addr, token_amount in candidates:
+        ton_amount = ton_spent_by.get(buyer_addr, 0.0)
+        if ton_amount <= 0:
+            continue
         buys.append({
             "tx": tx_hash or event_id,
-            "buyer": user_addr,
+            "buyer": buyer_addr,
             "ton": ton_amount,
             "token_amount": token_amount,
             "event_id": event_id,
@@ -549,7 +603,8 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
             # TonAPI events baseline for DeDust pools that don't expose /trades yet (new/legacy pools)
             if not trades:
                 try:
-                    events = await _to_thread(tonapi_account_events_subject, dedust_pool, 40)
+                    # Full /events is safer for DeDust pools; subject_only can omit TON transfers.
+                    events = await _to_thread(tonapi_account_events, dedust_pool, 40)
                     if isinstance(events, list) and events:
                         newest = events[0]  # newest first
                         eid = str(newest.get('event_id') or newest.get('id') or '').strip()
@@ -2621,7 +2676,9 @@ async def poll_once(app: Application):
                                 # TonAPI events fallback (covers DeDust pools where /trades is empty or lagging)
                 if not posted_any:
                     try:
-                        events = await _to_thread(tonapi_account_events_subject, pool, 40)
+                        # Use full /events (subject_only=false) because subject_only can omit
+                        # TonTransfer details needed to calculate TON spent on some DeDust v3 swaps.
+                        events = await _to_thread(tonapi_account_events, pool, 40)
                         if isinstance(events, list) and events:
                             last_eid = str(token.get('last_dedust_event_id') or '').strip()
                             try:
@@ -2654,7 +2711,7 @@ async def poll_once(app: Application):
                                     new_events.append(ev)
                 
                                 for ev in reversed(new_events):
-                                    buys = dedust_buys_from_tonapi_event(ev, token['address'])
+                                    buys = dedust_buys_from_tonapi_event(ev, token['address'], pool)
                                     for b in buys:
                                         ton_amt = float(b.get('ton') or 0.0)
                                         if ton_amt < min_buy:

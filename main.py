@@ -2215,6 +2215,51 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
     ston_pool = find_stonfi_ton_pair_for_token(jetton) if dex_mode in ("both","ston","stonfi") else None
     dedust_pool = find_dedust_ton_pair_for_token(jetton) if dex_mode in ("both","dedust") else None
 
+    # If the user pasted a non-canonical address (e.g. a site-added suffix like "-Lone"),
+    # we can still recover the correct jetton master from the resolved pool metadata.
+    # This prevents "pool found but no buys" situations caused by address mismatches.
+    if dedust_pool:
+        try:
+            p = _dex_pair_lookup(dedust_pool)
+            if isinstance(p, dict):
+                base = p.get("baseToken") or {}
+                quote = p.get("quoteToken") or {}
+                base_sym = str(base.get("symbol") or "").upper()
+                quote_sym = str(quote.get("symbol") or "").upper()
+                base_addr = str(base.get("address") or "").strip()
+                quote_addr = str(quote.get("address") or "").strip()
+                recovered = ""
+                if base_sym in ("TON", "WTON") and quote_addr:
+                    recovered = quote_addr
+                elif quote_sym in ("TON", "WTON") and base_addr:
+                    recovered = base_addr
+                elif base_addr:
+                    recovered = base_addr
+                elif quote_addr:
+                    recovered = quote_addr
+
+                if recovered and recovered != jetton:
+                    log.warning("Jetton address corrected via pool metadata: %s -> %s", jetton, recovered)
+                    jetton = recovered
+
+                    # Refresh metadata using the corrected address (best-effort).
+                    gk2 = gecko_token_info(jetton)
+                    name2 = (gk2.get("name") or "").strip() if gk2 else ""
+                    sym2 = (gk2.get("symbol") or "").strip() if gk2 else ""
+                    if not name2 and not sym2:
+                        info2 = tonapi_jetton_info(jetton)
+                        name2 = (info2.get("name") or "").strip()
+                        sym2 = (info2.get("symbol") or "").strip()
+                    if not name2 and not sym2:
+                        dx2 = dex_token_info(jetton)
+                        name2 = (dx2.get("name") or "").strip()
+                        sym2 = (dx2.get("symbol") or "").strip()
+                    if name2 or sym2:
+                        name = name2 or name
+                        sym = sym2 or sym
+        except Exception:
+            pass
+
     g = get_group(chat_id)
     # Auto-enable pools we actually found.
     # In auto/both mode we keep both enabled if pools exist (no manual DEX split required).

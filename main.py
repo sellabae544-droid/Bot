@@ -164,7 +164,7 @@ def _dedust_is_ton_asset(asset: Any) -> bool:
         return True
     # sometimes TON shown as jetton with empty address
     sym = (asset.get("symbol") or "").upper()
-    if sym == "TON":
+    if sym in ("TON","WTON"):
         return True
     addr = (asset.get("address") or "").strip()
     # TON has no jetton master address; keep conservative
@@ -176,10 +176,22 @@ def _dedust_asset_addr(asset: Any) -> str:
     return str(asset.get("address") or asset.get("master") or asset.get("jetton") or "").strip()
 
 def find_dedust_ton_pair_for_token(token_address: str) -> Optional[str]:
-    """Find DeDust pool address for TON <-> token using DeDust API pools list."""
+    """Find DeDust pool address for TON <-> token.
+
+    Primary method: DexScreener token endpoint filtered to DeDust (fast + includes new pools).
+    Fallback: DeDust API pools list (may lag / be paginated).
+    """
     ta = (token_address or "").strip()
     if not ta:
         return None
+
+    # 1) DexScreener (most reliable for newly created pools)
+    try:
+        pair = find_pair_for_token_on_dex(ta, "dedust")
+        if pair:
+            return pair
+    except Exception:
+        pass
     try:
         pools = dedust_get_pools()
         best_pool = None

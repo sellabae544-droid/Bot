@@ -24,7 +24,7 @@ log = logging.getLogger("spyton_public")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
 TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io").strip().rstrip("/")
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "6.0"))
+POLL_INTERVAL = max(2.0, float(os.getenv("POLL_INTERVAL", "2.0")))
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 DTRADE_REF = os.getenv("DTRADE_REF", "https://t.me/dtrade?start=11TYq7LInG").strip()
 TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/SpyTonTrending").strip()
@@ -291,6 +291,15 @@ def dedust_trade_to_buy(tr: Dict[str, Any], token_addr: str) -> Optional[Dict[st
         ton_amt = ton_amt / 1e9
 
     token_amt = amt_out_f
+    # DeDust API sometimes returns jetton amount in minimal units (integer-like).
+    # Convert using jetton decimals when it looks too large.
+    try:
+        dec = int(get_jetton_meta(token_addr).get("decimals") or 9)
+        if token_amt > 1e8:
+            token_amt = token_amt / (10 ** dec)
+    except Exception:
+        pass
+
     return {
         "tx": tx or trade_id,
         "buyer": buyer,
@@ -354,8 +363,13 @@ def dedust_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str, pool_addr
             continue
 
         amt_raw = jt.get("amount")
+        # Prefer cached decimals from jetton master (some events omit decimals)
+        dec = 9
         try:
-            dec = int(jetton.get("decimals", 9)) if isinstance(jetton, dict) else 9
+            if isinstance(jetton, dict) and jetton.get("decimals") is not None:
+                dec = int(jetton.get("decimals") or 9)
+            else:
+                dec = int(get_jetton_meta(token_addr).get("decimals") or 9)
         except Exception:
             dec = 9
         try:
@@ -543,6 +557,39 @@ def save_seen():
 # -------------------- CACHES --------------------
 TX_LT_CACHE: Dict[str, Tuple[int, str]] = {}  # key=f"{account}:{lt}" -> (ts, hash)
 MARKET_CACHE: Dict[str, Dict[str, Any]] = {}  # key=pool or token -> {ts, price_usd, liq_usd, mc_usd, holders}
+
+# Jetton metadata cache (decimals/symbol/name) to fix wrong amounts from some DEX APIs
+JETTON_META_CACHE: dict[str, dict] = {}  # jetton_addr -> {ts, name, symbol, decimals}
+
+def get_jetton_meta(jetton: str, ttl: int = 3600) -> dict:
+    """Return cached jetton metadata (name/symbol/decimals) via TonAPI.
+
+    Some DeDust endpoints return jetton amounts in minimal units; decimals are required
+    to convert to human numbers. We cache to avoid spamming TonAPI.
+    """
+    jetton = str(jetton or '').strip()
+    if not jetton:
+        return {"name": "", "symbol": "", "decimals": 9, "holders_count": None}
+    now = int(time.time())
+    hit = JETTON_META_CACHE.get(jetton)
+    if isinstance(hit, dict) and now - int(hit.get('ts') or 0) < ttl:
+        return hit.get('data') or hit
+    info = tonapi_jetton_info(jetton)
+    data = {
+        'name': str(info.get('name') or '').strip(),
+        'symbol': str(info.get('symbol') or '').strip(),
+        'decimals': int(info.get('decimals') or 9) if str(info.get('decimals') or '').strip().isdigit() else (info.get('decimals') or 9),
+        'holders_count': info.get('holders_count'),
+    }
+    # harden decimals
+    try:
+        data['decimals'] = int(data['decimals'])
+    except Exception:
+        data['decimals'] = 9
+    JETTON_META_CACHE[jetton] = {'ts': now, 'data': data}
+    return data
+
+
 
 # TON/USD price cache (for USD min-buy)
 TON_PRICE_CACHE: Dict[str, Any] = {"ts": 0, "usd": None}
@@ -752,17 +799,35 @@ def tonapi_get(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Di
 def tonapi_jetton_info(jetton: str) -> Dict[str, Any]:
     """Fetch basic jetton metadata from TonAPI.
 
-    We keep this as a small dict used across the bot. TonAPI responses often
-    include holders_count at the top-level.
+    Returns a small dict used across the bot:
+      - name, symbol
+      - decimals (int, default 9)
+      - holders_count (best-effort)
+
+    Note: Some DEX endpoints return amounts in minimal units, so decimals are critical.
     """
-    out: Dict[str, Any] = {"name": "", "symbol": "", "holders_count": None}
+    out: Dict[str, Any] = {"name": "", "symbol": "", "decimals": 9, "holders_count": None}
     js = tonapi_get(f"{TONAPI_BASE}/v2/jettons/{jetton}")
     if not js:
         return out
+
     meta = js.get("metadata") or {}
-    out["name"] = str(meta.get("name") or js.get("name") or "").strip()
-    out["symbol"] = str(meta.get("symbol") or js.get("symbol") or "").strip()
-    # TonAPI commonly exposes holders_count at top-level (naming varies)
+    out["name"] = str((meta.get("name") if isinstance(meta, dict) else None) or js.get("name") or "").strip()
+    out["symbol"] = str((meta.get("symbol") if isinstance(meta, dict) else None) or js.get("symbol") or "").strip()
+
+    # decimals may be in metadata or root and can be a string
+    dec = None
+    if isinstance(meta, dict):
+        dec = meta.get("decimals")
+    if dec is None:
+        dec = js.get("decimals")
+    try:
+        if dec is not None and str(dec).strip() != "":
+            out["decimals"] = int(str(dec).strip())
+    except Exception:
+        out["decimals"] = 9
+
+    # holders count
     try:
         for k in ("holders_count", "holders", "holdersCount", "total_holders", "holders_total"):
             hc = js.get(k)
@@ -776,6 +841,7 @@ def tonapi_jetton_info(jetton: str) -> Dict[str, Any]:
                 break
     except Exception:
         pass
+
     return out
 
 def tonapi_jetton_holders_count(jetton: str) -> Optional[int]:
@@ -2267,6 +2333,14 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
                 holders_seed = int(hh2)
         except Exception:
             pass
+    # decimals for correct amount formatting
+    decimals_seed: int = 9
+    try:
+        meta_j = get_jetton_meta(jetton)
+        decimals_seed = int(meta_j.get("decimals") or 9)
+    except Exception:
+        decimals_seed = 9
+
     ston_pool = find_stonfi_ton_pair_for_token(jetton) if dex_mode in ("both","ston","stonfi") else None
     dedust_pool = find_dedust_ton_pair_for_token(jetton) if dex_mode in ("both","dedust") else None
 
@@ -2338,6 +2412,7 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "dex_mode": ("auto" if dex_mode=="both" else dex_mode),
         "name": name,
         "symbol": sym,
+        "decimals": int(decimals_seed) if str(decimals_seed).isdigit() else 9,
         "holders": holders_seed,
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
@@ -2892,6 +2967,17 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         except Exception:
             return None
 
+    def fmt_token_amount(x: float) -> str:
+        try:
+            ax = abs(float(x))
+        except Exception:
+            return str(x)
+        if ax >= 1000:
+            return f"{float(x):,.2f}"
+        if ax >= 1:
+            return f"{float(x):,.4f}"
+        return f"{float(x):,.6f}"
+
     # Crypton-style buy strength bar
     strength_block = ""
     if bool(s.get("strength_on", True)):
@@ -2922,7 +3008,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     if tok_amt and tok_symbol:
         try:
             tok_amt_f = float(tok_amt)
-            lines.append(f"Got: *{tok_amt_f:,.0f} {html.escape(str(tok_symbol))}*")
+            lines.append(f"Got: *{fmt_token_amount(tok_amt_f)} {html.escape(str(tok_symbol))}*")
         except Exception:
             lines.append(f"Got: *{html.escape(str(tok_amt))} {html.escape(str(tok_symbol))}*")
     lines.append("")
